@@ -1,0 +1,206 @@
+{
+  "Systran--faster-whisper-large-v2": {
+    "directory": "C:\\Users\\Administrator\\Documents\\trae_projects\\1\\models\\Systran--faster-whisper-large-v2",
+    "file_info": {
+      "config.json": {
+        "size": 2796,
+        "mtime": 1771140480.5244434
+      },
+      "model.bin": {
+        "size": 3086912962,
+        "mtime": 1771140522.2277539
+      },
+      "tokenizer.json": {
+        "size": 2203239,
+        "mtime": 1771140524.0154557
+      },
+      "vocabulary.txt": {
+        "size": 459861,
+        "mtime": 1771140525.0661087
+      }
+    },
+    "timestamp": 1771140744.8237097
+  },
+  "Systran--faster-whisper-large-v3": {
+    "directory": "C:\\Users\\Administrator\\Documents\\trae_projects\\1\\models\\Systran--faster-whisper-large-v3",
+    "file_info": {
+      "config.json": {
+        "size": 2394,
+        "mtime": 1771140534.332879
+      },
+      "model.bin": {
+        "size": 3087284237,
+        "mtime": 1771140575.6339078
+      },
+      "preprocessor_config.json": {
+        "size": 340,
+        "mtime": 1771140576.560427
+      },
+      "tokenizer.json": {
+        "size": 2480617,
+        "mtime": 1771140578.092219
+      },
+      "vocabulary.json": {
+        "size": 1068114,
+        "mtime": 1771140579.7681196
+      }
+    },
+    "timestamp": 1771140744.8237097
+  },
+  "facebook--m2m100_1.2B": {
+    "directory": "C:\\Users\\Administrator\\Documents\\trae_projects\\1\\models\\facebook--m2m100_1.2B",
+    "file_info": {
+      "config.json": {
+        "size": 909,
+        "mtime": 1771140584.920171
+      },
+      "generation_config.json": {
+        "size": 233,
+        "mtime": 1771140585.7068806
+      },
+      "pytorch_model.bin": {
+        "size": 4958230644,
+        "mtime": 1771140645.600372
+      },
+      "sentencepiece.bpe.model": {
+        "size": 2423393,
+        "mtime": 1771140647.1446836
+      },
+      "special_tokens_map.json": {
+        "size": 1140,
+        "mtime": 1771140648.0451806
+      },
+      "tokenizer_config.json": {
+        "size": 271,
+        "mtime": 1771140648.8790457
+      },
+      "vocab.json": {
+        "size": 3708092,
+        "mtime": 1771140650.845416
+      }
+    },
+    "timestamp": 1771140744.8237097
+  },
+  "Systran--faster-whisper-tiny": {
+    "directory": "C:\\Users\\Administrator\\Documents\\trae_projects\\1\\models\\Systran--faster-whisper-tiny",
+    "file_info": {
+      "config.json": {
+        "size": 2249,
+        "mtime": 1771140656.8133602
+      },
+      "model.bin": {
+        "size": 75538270,
+        "mtime": 1771140659.159836
+      },
+      "tokenizer.json": {
+        "size": 2203239,
+        "mtime": 1771140660.5873756
+      },
+      "vocabulary.txt": {
+        "size": 459861,
+        "mtime": 1771140661.7171128
+      }
+    },
+    "timestamp": 1771140744.8237097
+  },
+  "Systran--faster-whisper-base": {
+    "directory": "C:\\Users\\Administrator\\Documents\\trae_projects\\1\\models\\Systran--faster-whisper-base",
+    "file_info": {
+      "config.json": {
+        "size": 2309,
+        "mtime": 1771140664.1262121
+      },
+      "model.bin": {
+        "size": 145217532,
+        "mtime": 1771140667.7492335
+      },
+      "tokenizer.json": {
+        "size": 2203239,
+        "mtime": 1771140669.305674
+      },
+      "vocabulary.txt": {
+        "size": 459861,
+        "mtime": 1771140670.2720542
+      }
+    },
+    "timestamp": 1771140744.8237097
+  },
+  "Systran--faster-whisper-small": {
+    "directory": "C:\\Users\\Administrator\\Documents\\trae_projects\\1\\models\\Systran--faster-whisper-small",
+    "file_info": {
+      "config.json": {
+        "size": 2370,
+        "mtime": 1771140671.7861242
+      },
+      "model.bin": {
+        "size": 483546902,
+        "mtime": 1771140680.7842863
+      },
+      "tokenizer.json": {
+        "size": 2203239,
+        "mtime": 1771140682.2161705
+      },
+      "vocabulary.txt": {
+        "size": 459861,
+        "mtime": 1771140683.559737
+      }
+    },
+    "timestamp": 1771140744.8237097
+  },
+  "Systran--faster-whisper-medium": {
+    "directory": "C:\\Users\\Administrator\\Documents\\trae_projects\\1\\models\\Systran--faster-whisper-medium",
+    "file_info": {
+      "config.json": {
+        "size": 2257,
+        "mtime": 1771140685.6091251
+      },
+      "model.bin": {
+        "size": 1527906378,
+        "mtime": 1771140706.4528482
+      },
+      "tokenizer.json": {
+        "size": 2203239,
+        "mtime": 1771140707.8747706
+      },
+      "vocabulary.txt": {
+        "size": 459861,
+        "mtime": 1771140708.7429304
+      }
+    },
+    "timestamp": 1771140744.8237097
+  },
+  "facebook--m2m100_418M": {
+    "directory": "C:\\Users\\Administrator\\Documents\\trae_projects\\1\\models\\facebook--m2m100_418M",
+    "file_info": {
+      "config.json": {
+        "size": 908,
+        "mtime": 1771140711.825915
+      },
+      "generation_config.json": {
+        "size": 233,
+        "mtime": 1771140712.4051404
+      },
+      "pytorch_model.bin": {
+        "size": 1935796948,
+        "mtime": 1771140739.4751444
+      },
+      "sentencepiece.bpe.model": {
+        "size": 2423393,
+        "mtime": 1771140740.7150645
+      },
+      "special_tokens_map.json": {
+        "size": 1140,
+        "mtime": 1771140741.4704716
+      },
+      "tokenizer_config.json": {
+        "size": 298,
+        "mtime": 1771140742.1904552
+      },
+      "vocab.json": {
+        "size": 3708092,
+        "mtime": 1771140743.615519
+      }
+    },
+    "timestamp": 1771140744.8237097
+  }
+}

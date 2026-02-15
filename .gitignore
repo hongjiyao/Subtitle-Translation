@@ -1,0 +1,55 @@
+# 虚拟环境
+venv/
+env/
+*.venv/
+*.env/
+
+# 模型文件
+models/
+
+# 临时文件
+temp/
+tmp/
+*.tmp
+
+# 输出文件
+outputs/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
+# 保存的参数文件
+saved_params.json
+
+# 日志文件
+*.log
