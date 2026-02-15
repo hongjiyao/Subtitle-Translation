@@ -46,14 +46,7 @@ cd Subtitle-Translation
 venv_setup.bat
 ```
 
-### 2. 下载模型
-
-```batch
-# 运行模型下载脚本
-python download_all_models.py
-```
-
-### 3. 启动应用
+### 2. 启动应用
 
 ```batch
 # 双击运行或在命令行中执行
