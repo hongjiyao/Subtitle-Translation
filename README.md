@@ -46,27 +46,11 @@ cd Subtitle-Translation
 venv_setup.bat
 ```
 
-### 2. 下载模型
-
-```batch
-# 运行模型下载脚本
-python download_all_models.py
-```
-
-### 3. 启动应用
+### 2. 启动应用
 
 ```batch
 # 双击运行或在命令行中执行
 start.bat
-```
-
-**或手动启动：**
-```batch
-# 激活虚拟环境
-venv\Scripts\activate
-
-# 启动应用
-python ui.py
 ```
 
 启动后，在浏览器中打开：`http://localhost:7868`
