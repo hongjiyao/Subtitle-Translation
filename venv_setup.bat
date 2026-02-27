@@ -101,19 +101,32 @@ echo [5/7] Installing packages to virtual environment...
 echo This may take a few minutes...
 echo.
 
-:: Install key packages
-echo Installing main packages...
-"%VENV_NAME%\Scripts\pip.exe" install gradio torch transformers
+:: First install CUDA version of PyTorch with specific index
+echo Installing CUDA version of PyTorch...
+"%VENV_NAME%\Scripts\pip.exe" install torch==2.10.0+cu126 --index-url https://download.pytorch.org/whl/cu126
 
-:: Install whisper, faster-whisper and sentencepiece
+:: Install all packages from requirements.txt
 echo.
-echo Installing whisper and faster-whisper...
-"%VENV_NAME%\Scripts\pip.exe" install openai-whisper faster-whisper sentencepiece 2>nul || echo [WARN] Some packages may need manual install
-
-:: Install other packages
-echo.
-echo Installing other packages...
-"%VENV_NAME%\Scripts\pip.exe" install ffmpy ImageIO imageio-ffmpeg moviepy numpy pandas pydantic requests tqdm rich
+echo Installing all packages from requirements.txt...
+if exist "requirements.txt" (
+    "%VENV_NAME%\Scripts\pip.exe" install -r requirements.txt
+    echo [OK] Requirements installed
+) else (
+    echo [WARN] requirements.txt not found, installing basic packages
+    :: Install key packages
+    echo Installing main packages...
+    "%VENV_NAME%\Scripts\pip.exe" install gradio torch transformers
+    
+    :: Install whisper, faster-whisper and sentencepiece
+    echo.
+    echo Installing whisper and faster-whisper...
+    "%VENV_NAME%\Scripts\pip.exe" install openai-whisper faster-whisper sentencepiece 2>nul || echo [WARN] Some packages may need manual install
+    
+    :: Install other packages
+    echo.
+    echo Installing other packages...
+    "%VENV_NAME%\Scripts\pip.exe" install ffmpy ImageIO imageio-ffmpeg moviepy numpy pandas pydantic requests tqdm rich
+)
 
 echo [OK] Installation complete
 echo.
