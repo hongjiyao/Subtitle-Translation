@@ -90,42 +90,41 @@ if errorlevel 1 (
 echo [OK] Virtual environment created
 echo.
 
-:: Step 4: Activate and upgrade pip
-echo [4/7] Activating and upgrading pip...
-call "%VENV_NAME%\Scripts\activate.bat"
-python -m pip install --upgrade pip
+:: Step 4: Upgrade pip in virtual environment
+echo [4/7] Upgrading pip in virtual environment...
+"%VENV_NAME%\Scripts\python.exe" -m pip install --upgrade pip
 echo [OK] pip upgraded
 echo.
 
-:: Step 5: Install packages
-echo [5/7] Installing packages...
+:: Step 5: Install packages to virtual environment
+echo [5/7] Installing packages to virtual environment...
 echo This may take a few minutes...
 echo.
 
 :: Install key packages
 echo Installing main packages...
-pip install gradio torch transformers
+"%VENV_NAME%\Scripts\pip.exe" install gradio torch transformers
 
-:: Try to install whisper (may fail due to permissions)
+:: Install whisper, faster-whisper and sentencepiece
 echo.
-echo Installing whisper...
-pip install openai-whisper 2>nul || echo [WARN] whisper may need manual install
+echo Installing whisper and faster-whisper...
+"%VENV_NAME%\Scripts\pip.exe" install openai-whisper faster-whisper sentencepiece 2>nul || echo [WARN] Some packages may need manual install
 
 :: Install other packages
 echo.
 echo Installing other packages...
-pip install ffmpy ImageIO imageio-ffmpeg moviepy numpy pandas pydantic requests tqdm rich
+"%VENV_NAME%\Scripts\pip.exe" install ffmpy ImageIO imageio-ffmpeg moviepy numpy pandas pydantic requests tqdm rich
 
 echo [OK] Installation complete
 echo.
 
-:: Step 6: Verify installation
-echo [6/7] Verifying packages...
+:: Step 6: Verify installation in virtual environment
+echo [6/7] Verifying packages in virtual environment...
 set OK_COUNT=0
 set TOTAL_COUNT=0
 
 echo Checking gradio...
-python -c "import gradio; print('  OK: gradio')" 2>nul
+"%VENV_NAME%\Scripts\python.exe" -c "import gradio; print('  OK: gradio')" 2>nul
 if errorlevel 1 (
     echo   FAIL: gradio
 ) else (
@@ -134,7 +133,7 @@ if errorlevel 1 (
 set /a TOTAL_COUNT+=1
 
 echo Checking torch...
-python -c "import torch; print('  OK: torch')" 2>nul
+"%VENV_NAME%\Scripts\python.exe" -c "import torch; print('  OK: torch')" 2>nul
 if errorlevel 1 (
     echo   FAIL: torch
 ) else (
@@ -143,9 +142,36 @@ if errorlevel 1 (
 set /a TOTAL_COUNT+=1
 
 echo Checking transformers...
-python -c "import transformers; print('  OK: transformers')" 2>nul
+"%VENV_NAME%\Scripts\python.exe" -c "import transformers; print('  OK: transformers')" 2>nul
 if errorlevel 1 (
     echo   FAIL: transformers
+) else (
+    set /a OK_COUNT+=1
+)
+set /a TOTAL_COUNT+=1
+
+echo Checking whisper...
+"%VENV_NAME%\Scripts\python.exe" -c "import whisper; print('  OK: whisper')" 2>nul
+if errorlevel 1 (
+    echo   FAIL: whisper
+) else (
+    set /a OK_COUNT+=1
+)
+set /a TOTAL_COUNT+=1
+
+echo Checking faster_whisper...
+"%VENV_NAME%\Scripts\python.exe" -c "import faster_whisper; print('  OK: faster_whisper')" 2>nul
+if errorlevel 1 (
+    echo   FAIL: faster_whisper
+) else (
+    set /a OK_COUNT+=1
+)
+set /a TOTAL_COUNT+=1
+
+echo Checking sentencepiece...
+"%VENV_NAME%\Scripts\python.exe" -c "import sentencepiece; print('  OK: sentencepiece')" 2>nul
+if errorlevel 1 (
+    echo   FAIL: sentencepiece
 ) else (
     set /a OK_COUNT+=1
 )

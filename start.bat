@@ -7,8 +7,48 @@ echo.
 set "PYTHON_DIR=python311"
 set "PYTHON_INSTALLER=python-3.11.7-amd64.exe"
 set "PYTHON_URL=https://www.python.org/ftp/python/3.11.7/%PYTHON_INSTALLER%"
+set "VC_REDIST_INSTALLER=VC_redist.x64.exe"
+set "VC_REDIST_URL=https://download.visualstudio.microsoft.com/download/pr/6f02464a-5e9b-486d-a506-c99a17db9a83/8995548DFFFCDE7C49987029C764355612BA6850EE09A7B6F0FDDC85BDC5C280/VC_redist.x64.exe"
 
 echo Starting installer...
+echo.
+
+:: Check and install VC Redist
+echo Checking Visual C++ Redistributable...
+reg query "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" >nul 2>&1
+if errorlevel 1 (
+    echo VC Redist not found, checking alternative registry key...
+    reg query "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{e2803110-78b3-4664-a479-3611a381656a}" >nul 2>&1
+    if errorlevel 1 (
+        echo [INFO] Downloading VC Redist...
+        echo This may take a few minutes...
+        
+        set "VC_DOWNLOADED=0"
+        
+        :: Download VC Redist
+        powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%VC_REDIST_URL%' -OutFile '%VC_REDIST_INSTALLER%'"
+        if exist "%VC_REDIST_INSTALLER%" (
+            set "VC_DOWNLOADED=1"
+            echo [OK] VC Redist installer downloaded
+        )
+        
+        :: If download succeeded, install
+        if "%VC_DOWNLOADED%"=="1" (
+            echo Installing VC Redist...
+            echo Please wait, this may take a few minutes...
+            start /wait "" "%VC_REDIST_INSTALLER%" /quiet /norestart
+            echo [OK] VC Redist installed successfully
+            del "%VC_REDIST_INSTALLER%"
+        ) else (
+            echo [WARN] Failed to download VC Redist
+            echo Some features may not work properly
+        )
+    ) else (
+        echo [OK] VC Redist already installed
+    )
+) else (
+    echo [OK] VC Redist already installed
+)
 echo.
 
 :: Check Python
@@ -66,6 +106,16 @@ if errorlevel 1 (
     )
 )
 for /f "tokens=*" %%i in ('python --version 2^>^&1') do echo [OK] %%i
+echo.
+
+:: Activate virtual environment
+echo [INFO] Activating virtual environment...
+if exist ".venv_final\Scripts\activate.bat" (
+    call ".venv_final\Scripts\activate.bat"
+    echo [OK] Virtual environment activated
+) else (
+    echo [WARN] Virtual environment not found, using system Python
+)
 echo.
 
 :: Run Python setup script
