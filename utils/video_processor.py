@@ -30,7 +30,11 @@ def find_ffmpeg():
 
 def extract_audio(video_path):
     """从视频中提取音频"""
-    audio_path = os.path.join(TEMP_DIR, "audio.wav")
+    import uuid
+    # 使用唯一标识符生成临时音频文件名，避免文件冲突
+    unique_id = str(uuid.uuid4())[:8]
+    audio_filename = f"audio_{unique_id}.wav"
+    audio_path = os.path.join(TEMP_DIR, audio_filename)
     
     # 查找FFmpeg
     ffmpeg_path = find_ffmpeg()

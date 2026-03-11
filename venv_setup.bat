@@ -103,7 +103,7 @@ echo.
 
 :: First install CUDA version of PyTorch with specific index
 echo Installing CUDA version of PyTorch...
-"%VENV_NAME%\Scripts\pip.exe" install torch==2.10.0+cu126 --index-url https://download.pytorch.org/whl/cu126
+"%VENV_NAME%\Scripts\pip.exe" install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
 
 :: Install all packages from requirements.txt
 echo.
@@ -121,6 +121,11 @@ if exist "requirements.txt" (
     echo.
     echo Installing whisper and faster-whisper...
     "%VENV_NAME%\Scripts\pip.exe" install openai-whisper faster-whisper sentencepiece 2>nul || echo [WARN] Some packages may need manual install
+    
+    :: Install WhisperX
+    echo.
+    echo Installing WhisperX 3.8.1...
+    "%VENV_NAME%\Scripts\pip.exe" install whisperx==3.8.1 2>nul || echo [WARN] WhisperX may need manual install
     
     :: Install other packages
     echo.

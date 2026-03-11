@@ -19,19 +19,21 @@ def run_command(cmd):
         print(f"执行命令出错: {e}")
         return False
 
-print("=== 开始提交并推送修改 ===")
+print("=== 开始强制提交 ===")
 
-# 1. 提交代码
-print("\n1. 创建提交...")
-success = run_command('git commit -m "Add FFmpeg download script"')
+# 1. 添加所有更改（包括修改和删除的文件）
+print("\n1. 添加所有更改...")
+run_command('git add -A')
+
+# 2. 强制提交
+print("\n2. 强制提交...")
+run_command('git commit -m "Force commit: update all files" --force')
+
+# 3. 强制推送到 GitHub
+print("\n3. 强制推送到 GitHub...")
+success = run_command('git push -f origin main')
 
 if success:
-    print("\n2. 推送到 GitHub...")
-    success = run_command('git push')
-    
-    if success:
-        print("\n=== 上传成功！ ===")
-    else:
-        print("\n=== 推送失败 ===")
+    print("\n=== 强制提交成功！ ===")
 else:
-    print("\n=== 提交失败，可能没有需要提交的文件 ===")
+    print("\n=== 强制提交失败 ===")

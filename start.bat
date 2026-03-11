@@ -108,20 +108,21 @@ if errorlevel 1 (
 for /f "tokens=*" %%i in ('python --version 2^>^&1') do echo [OK] %%i
 echo.
 
-:: Activate virtual environment
-echo [INFO] Activating virtual environment...
-if exist ".venv_final\Scripts\activate.bat" (
-    call ".venv_final\Scripts\activate.bat"
-    echo [OK] Virtual environment activated
+:: Set virtual environment Python path
+echo [INFO] Setting up virtual environment Python...
+set "VENV_PYTHON=.venv_final\Scripts\python.exe"
+if exist "%VENV_PYTHON%" (
+    echo [OK] Found virtual environment Python at %VENV_PYTHON%
 ) else (
-    echo [WARN] Virtual environment not found, using system Python
+    echo [WARN] Virtual environment Python not found, using system Python
+    set "VENV_PYTHON=python"
 )
 echo.
 
 :: Run Python setup script
 echo [INFO] Running setup_all.py...
 echo.
-python setup_all.py
+"%VENV_PYTHON%" setup_all.py
 
 :: Check result
 if errorlevel 1 (
@@ -159,7 +160,7 @@ echo ========================================
 echo Downloading all models...
 echo ========================================
 echo.
-python download_all_models.py
+"%VENV_PYTHON%" download_all_models.py
 if errorlevel 1 (
     echo.
     echo [ERROR] Model download failed
@@ -175,7 +176,17 @@ echo ========================================
 echo Starting UI...
 echo ========================================
 echo.
-python ui.py
+echo UI is starting, please wait...
+echo.
+start "" /B "%VENV_PYTHON%" ui.py
+
+:: Wait for UI to start (give it some time to initialize)
+echo Waiting for UI to initialize...
+timeout /t 5 /nobreak >nul
+
+:: Open browser after UI has started
+echo Opening browser to http://localhost:7870...
+start http://localhost:7870
 goto end
 
 :both
@@ -184,7 +195,7 @@ echo ========================================
 echo Step 1: Downloading all models...
 echo ========================================
 echo.
-python download_all_models.py
+"%VENV_PYTHON%" download_all_models.py
 if errorlevel 1 (
     echo.
     echo [ERROR] Model download failed
@@ -199,7 +210,17 @@ echo ========================================
 echo Step 2: Starting UI...
 echo ========================================
 echo.
-python ui.py
+echo UI is starting, please wait...
+echo.
+start "" /B "%VENV_PYTHON%" ui.py
+
+:: Wait for UI to start (give it some time to initialize)
+echo Waiting for UI to initialize...
+timeout /t 5 /nobreak >nul
+
+:: Open browser after UI has started
+echo Opening browser to http://localhost:7870...
+start http://localhost:7870
 goto end
 
 :end

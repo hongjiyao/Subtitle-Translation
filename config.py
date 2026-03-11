@@ -18,7 +18,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # 默认配置
 DEFAULT_CONFIG = {
     # 语音识别模型 (small, medium, large, large-v2, large-v3)
-    "speech_recognition_model": "small",
+    "speech_recognition_model": "medium",
     
     # 翻译模型
     "translation_model": "facebook/m2m100_418M",
@@ -31,17 +31,21 @@ DEFAULT_CONFIG = {
     
     # 语音识别参数
     "speech_recognition_params": {
-        "beam_size": 1,
+        "beam_size": 5,  # 仅Faster-Whisper支持
         "vad_filter": True,
-        "word_timestamps": False,
-        "condition_on_previous_text": False
+        "word_timestamps": True,
+        "condition_on_previous_text": True
     },
     
     # 翻译参数
     "translation_params": {
-        "beam_size": 1,
-        "max_length": 256,
-        "early_stopping": True
+        "beam_size": 5,
+        "max_length": 500
+    },
+    
+    # WhisperX参数
+    "whisperx_params": {
+        "batch_size": 16
     }
 }
 

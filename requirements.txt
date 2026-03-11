@@ -3,9 +3,11 @@
 # 核心依赖
 openai-whisper==20250625
 faster-whisper==1.2.1
-transformers==5.1.0
-torch==2.10.0+cu126
-huggingface_hub==1.4.1
+transformers==4.57.6
+torch==2.8.0
+torchaudio==2.8.0
+torchvision==0.23.0
+huggingface_hub==0.36.2
 ctranslate2==4.7.1
 onnxruntime==1.24.1
 sentencepiece==0.2.1
@@ -98,3 +100,30 @@ tzdata==2025.3
 watchfiles==1.1.1
 websocket-client==1.9.0
 websockets==16.0
+
+# 音频处理
+pyannote-audio==4.0.4
+pyannote-core==6.0.1
+pyannote-database==6.1.1
+pyannote-metrics==4.0.0
+pyannote-pipeline==4.0.0
+pyannoteai-sdk==0.4.0
+torch-audiomentations==0.12.0
+torch_pitch_shift==1.2.5
+torchcodec==0.10.0
+torchmetrics==1.8.2
+asteroid-filterbanks==0.4.0
+julius==0.2.7
+
+# WhisperX
+transformers[sentencepiece]==4.57.6
+whisperx==3.8.1
+
+# 其他
+nltk==3.9.3
+optuna==4.7.0
+psutil==7.2.2
+pytorch-lightning==2.6.1
+pytorch-metric-learning==2.9.0
+lightning==2.6.1
+lightning-utilities==0.15.3

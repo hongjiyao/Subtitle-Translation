@@ -12,15 +12,22 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["HUGGINGFACE_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["TRANSFORMERS_OFFLINE"] = "0"
 os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
-os.environ["PYTORCH_TRANSFORMERS_CACHE"] = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
+os.environ["HF_HOME"] = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
+
+# 启用TF32以提高性能并避免pyannote.audio的ReproducibilityWarning
+import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 import time
 import subprocess
 from config import DEFAULT_CONFIG, TEMP_DIR, OUTPUT_DIR
 from utils.video_processor import extract_audio
-from utils.speech_recognizer import recognize_speech
-from utils.translator import translate_text
+from utils.speech_recognizer import recognize_speech, clear_model_cache
+from utils.translator import translate_text, clear_translator_cache
 from utils.subtitle_generator import generate_subtitle
+
+
 
 # 翻译模型映射
 translator_models = {
@@ -48,8 +55,10 @@ class QueueManager:
             if message and isinstance(message, str):
                 self.logs.append(message)
                 
-                # 直接打印日志到终端，不需要任何频率控制
-                print(f"[处理日志] {message}")
+                # 添加时间戳并打印日志到终端
+                import datetime
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{timestamp}] [处理日志] {message}")
                 
                 # 限制日志数量，避免内存占用过大
                 if len(self.logs) > 500:
@@ -57,7 +66,9 @@ class QueueManager:
             return "\n".join(self.logs)
         except Exception as e:
             # 忽略日志处理时的错误
-            print(f"[错误信息] 日志处理出错: {str(e)}")
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{timestamp}] [错误信息] 日志处理出错: {str(e)}")
             return ""
     
     def update_progress(self, value):
@@ -171,26 +182,26 @@ class QueueManager:
         # 标准化行内容，处理可能的编码问题
         normalized_line = line.strip().lower()
         
+        # 快速匹配阶段关键词
+        stage_keywords = {
+            '开始处理': ['开始', 'starting'],
+            '提取音频': ['提取音频', 'extract', 'audio'],
+            '音频提取完成': ['音频提取完成', 'audio extracted'],
+            '语音识别': ['语音识别', 'recogniz', 'transcrib'],
+            '语音识别完成': ['识别完成', 'transcript completed'],
+            '翻译日文': ['翻译', 'translate', '日文', 'japanese'],
+            '翻译完成': ['翻译完成', 'translation completed'],
+            '生成字幕': ['生成字幕', 'subtitle', 'srt'],
+            '字幕生成完成': ['字幕完成', 'subtitle completed']
+        }
+        
+        # 快速查找匹配的阶段
         for stage, target_progress in stage_progress.items():
-            stage_keywords = {
-                '开始处理': ['开始', 'starting'],
-                '提取音频': ['提取音频', 'ȡƵ', 'extract', 'audio'],
-                '音频提取完成': ['音频提取完成', 'audio extracted'],
-                '语音识别': ['语音识别', 'recogniz', 'transcrib'],
-                '语音识别完成': ['识别完成', 'transcript completed'],
-                '翻译日文': ['翻译', 'translate', '日文', 'japanese'],
-                '翻译完成': ['翻译完成', 'translation completed'],
-                '生成字幕': ['生成字幕', 'subtitle', 'srt'],
-                '字幕生成完成': ['字幕完成', 'subtitle completed']
-            }
-            
-            # 检查是否匹配当前阶段的任何关键词
-            if any(keyword in normalized_line for keyword in stage_keywords.get(stage, [stage.lower()])):
+            keywords = stage_keywords.get(stage, [stage.lower()])
+            if any(keyword in normalized_line for keyword in keywords):
                 if target_progress > current_progress:
-                    # 平滑过渡到目标进度
-                    while current_progress < target_progress:
-                        current_progress += 1
-                        self.update_progress(current_progress)
+                    # 直接设置目标进度，避免循环更新
+                    self.update_progress(target_progress)
                     stage_updated = True
                 break
         
@@ -442,6 +453,142 @@ class QueueManager:
             print(f"[错误信息] {error_msg}")
             return 0
     
+    def get_gpu_memory(self):
+        """使用nvidia-smi获取GPU内存使用情况
+        
+        Returns:
+            dict: 包含总内存和可用内存的字典
+        """
+        try:
+            import subprocess
+            import re
+            
+            # 执行nvidia-smi命令
+            result = subprocess.run(
+                ['nvidia-smi', '--query-gpu=memory.total,memory.free', '--format=csv,noheader,nounits'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            # 解析输出
+            output = result.stdout.strip()
+            if output:
+                total, free = map(int, output.split(','))
+                return {
+                    'total': total / 1024,  # 转换为GB
+                    'available': free / 1024,  # 转换为GB
+                    'allocated': (total - free) / 1024  # 转换为GB
+                }
+            return {'total': 0, 'available': 0, 'allocated': 0}
+        except Exception as e:
+            print(f"[错误信息] 获取GPU内存时出错: {str(e)}")
+            return {'total': 0, 'available': 0, 'allocated': 0}
+    
+    def adjust_batch_size(self, device, model_name, translator_model, use_whisperx=False):
+        """根据设备和模型自动调整批处理大小
+        
+        Args:
+            device: 设备选择
+            model_name: 语音识别模型名称
+            translator_model: 翻译模型名称
+            use_whisperx: 是否使用WhisperX
+            
+        Returns:
+            int: 调整后的批处理大小
+        """
+        if device == 'cpu':
+            return 1  # CPU模式下使用较小的批处理大小
+        
+        # 获取GPU内存情况
+        memory = self.get_gpu_memory()
+        total_memory = memory['total']
+        available_memory = memory['available']
+        
+        # 移除预留缓冲，完全使用可用内存
+        buffer_memory = 0
+        usable_memory = available_memory
+        
+        # 确定模型类型
+        is_translator = not (model_name in ['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3'])
+        model_type = "翻译模型" if is_translator else "语音模型"
+        
+        # 获取模型大小
+        if is_translator:
+            # 翻译模型大小
+            if '418M' in translator_model:
+                model_size = 1.85
+            elif '1.2B' in translator_model:
+                model_size = 4.73
+            else:
+                model_size = 1.85
+        else:
+            # 语音模型大小
+            default_sizes = {
+                'tiny': 0.07, 'base': 0.14, 'small': 0.46, 'medium': 1.46, 
+                'large': 3.09, 'large-v2': 3.09, 'large-v3': 3.09
+            }
+            model_size = default_sizes.get(model_name, 0.46)
+            
+            # WhisperX需要额外的内存
+            if use_whisperx:
+                model_size *= 1.2
+        
+        # 计算内存需求 - 进一步优化批次内存需求计算
+        # 对于批次处理，每个批次的内存需求通常远小于模型大小
+        if is_translator:
+            # 翻译模型批次内存需求
+            batch_memory_per_item = model_size * 0.5  # 进一步降低翻译模型批次内存需求
+        else:
+            # 语音模型批次内存需求
+            batch_memory_per_item = model_size * 0.4  # 进一步降低语音模型批次内存需求
+        
+        # 计算可用内存用于批处理 - 直接使用全部可用内存
+        memory_for_batching = max(0, usable_memory)
+        
+        # 计算批处理大小
+        if memory_for_batching <= 0:
+            batch_size = 1
+        else:
+            # 计算理论批处理大小
+            batch_size = int(memory_for_batching / batch_memory_per_item)
+            
+            # 确保批处理大小在合理范围内
+            batch_size = max(1, min(32, batch_size))
+            
+            # 应用模型特定的最大批处理大小限制
+            if not is_translator:
+                # 语音模型的最大批处理大小
+                max_sizes = {
+                    'tiny': 32, 'base': 24, 'small': 16, 'medium': 12,
+                    'large': 6, 'large-v2': 6, 'large-v3': 6
+                }
+                batch_size = min(batch_size, max_sizes.get(model_name, 12))
+            else:
+                # 翻译模型的最大批处理大小
+                if '418M' in translator_model:
+                    batch_size = min(batch_size, 24)
+                elif '1.2B' in translator_model:
+                    batch_size = min(batch_size, 12)
+                else:
+                    batch_size = min(batch_size, 24)
+        
+        # 打印内存占用信息
+        info = [
+            f"[内存管理] GPU总内存: {total_memory:.2f}GB, 可用内存: {available_memory:.2f}GB",
+            f"[内存管理] 预留缓冲: {buffer_memory:.2f}GB, 可用内存(扣除缓冲): {usable_memory:.2f}GB",
+            f"[内存管理] {model_type}大小: {model_size:.2f}GB",
+            f"[内存管理] 批处理可用内存: {memory_for_batching:.2f}GB",
+            f"[内存管理] 每个批次内存需求: {batch_memory_per_item:.2f}GB (优化计算)",
+            f"[内存管理] 调整批处理大小为: {batch_size}"
+        ]
+        
+        for line in info:
+            print(line)
+            self.log_message(line)
+        
+        return batch_size
+    
     def process_video(self, video_file, params):
         """处理单个视频文件
         
@@ -455,18 +602,8 @@ class QueueManager:
         # 定义一个内部进度回调函数，用于实时更新进度
         def progress_callback(progress):
             """进度回调函数"""
+            # 只更新进度，不打印日志，避免大量重复输出
             self.update_progress(progress)
-            print(f"[进度更新] 当前进度: {progress}%")
-        # 在函数开始处导入必要的模块
-        import os
-        import sys
-        import time
-        from tqdm import tqdm
-        from utils.video_processor import extract_audio
-        from utils.speech_recognizer import recognize_speech
-        from utils.translator import translate_text
-        from utils.subtitle_generator import generate_subtitle
-        from config import DEFAULT_CONFIG, TEMP_DIR, OUTPUT_DIR
         
         try:
             # 验证输入
@@ -560,11 +697,23 @@ class QueueManager:
                 print(f"[错误信息] {error_msg}")
                 return False, "生成输出路径时出错", None, []
             
+            # 获取语言设置
+            source_language = params.get('source_language', 'auto')
+            target_language = params.get('target_language', 'zh')
+            
+            # 内存管理：检查初始内存状态
+            print("[内存管理] 检查初始内存状态...")
+            memory_status = self.get_gpu_memory()
+            print(f"[内存管理] 初始GPU内存: 总内存={memory_status['total']:.2f}GB, 可用内存={memory_status['available']:.2f}GB")
+            self.log_message(f"[内存管理] 初始GPU内存: 总内存={memory_status['total']:.2f}GB, 可用内存={memory_status['available']:.2f}GB")
+            
             self.log_message(f"开始处理视频: {video_file}")
             self.log_message(f"输出路径: {output_path}")
             self.log_message(f"使用模型: {params['model']}")
             self.log_message(f"使用翻译模型: {translator_model}")
             self.log_message(f"设备选择: {params['device']}")
+            self.log_message(f"源语言: {source_language}")
+            self.log_message(f"目标语言: {target_language}")
             
             # 直接调用处理逻辑，不使用 subprocess
             try:
@@ -592,22 +741,51 @@ class QueueManager:
                 # 更新进度
                 self.update_progress(30)
                 
+                # 内存管理：音频提取后清理内存
+                print("[内存管理] 音频提取后清理内存...")
+                try:
+                    import gc
+                    gc.collect()
+                except Exception as e:
+                    print(f"[错误信息] 清理内存时出错: {str(e)}")
+                
                 # 2. 语音识别
                 print("[处理阶段] 2. 语音识别...")
                 self.log_message("\n2. 语音识别...")
+                
+                # 内存管理：语音识别前检查内存
+                memory_status = self.get_gpu_memory()
+                print(f"[内存管理] 语音识别前GPU内存: 可用内存={memory_status['available']:.2f}GB")
+                
+                # 使用用户设置的批处理大小
+                use_whisperx = params.get('use_whisperx', False)
+                speech_batch_size = params.get('speech_batch_size', DEFAULT_CONFIG["whisperx_params"].get("batch_size", 16))
+                print(f"[内存管理] 使用用户设置的语音模型批处理大小: {speech_batch_size}")
+                self.log_message(f"[内存管理] 使用用户设置的语音模型批处理大小: {speech_batch_size}")
+                
                 start_time = time.time()
                 
                 try:
+                    # 如果源语言不是auto，传递给recognize_speech
+                    detected_language = source_language if source_language != 'auto' else None
+                    # 始终使用WhisperX和Pyannote VAD
                     recognized_text = recognize_speech(
-                        audio_path, 
-                        params['model'], 
-                        device_choice=params['device'],
-                        progress_callback=lambda progress: progress_callback(30 + progress * 0.25),
-                        beam_size=params['beam_size'],
-                        vad_filter=params['vad_filter'],
-                        word_timestamps=params['word_timestamps'],
-                        condition_on_previous_text=params['condition_on_previous_text']
-                    )
+                            audio_path, 
+                            params['model'], 
+                            detected_language=detected_language,
+                            device_choice=params['device'],
+                            progress_callback=lambda progress: progress_callback(30 + progress * 0.25),
+                            vad_filter=params['vad_filter'],
+                            word_timestamps=False,  # WhisperX不再支持单词时间戳
+                            condition_on_previous_text=params['condition_on_previous_text'],
+                            use_whisperx=True,
+                            whisperx_batch_size=speech_batch_size,
+                            # Pyannote VAD参数
+                            vad_threshold=params.get('vad_threshold', 0.5),
+                            vad_min_speech_duration_ms=params.get('vad_min_speech_duration_ms', 250),
+                            vad_max_speech_duration_s=params.get('vad_max_speech_duration_s', 30),
+                            vad_min_silence_duration_ms=params.get('vad_min_silence_duration_ms', 100)
+                        )
                 except Exception as e:
                     error_msg = f"语音识别失败 - {str(e)}"
                     print(f"[错误信息] {error_msg}")
@@ -622,18 +800,59 @@ class QueueManager:
                 self.log_message(recognize_msg)
                 self.log_message(language_msg)
                 
+                # 内存管理：语音识别后检查内存
+                memory_status = self.get_gpu_memory()
+                print(f"[内存管理] 语音识别后GPU内存: 可用内存={memory_status['available']:.2f}GB")
+                
                 # 更新进度
                 self.update_progress(55)
                 
-                # 3. 翻译日文（如果检测到的不是中文）
+                # 卸载语音模型，释放显存
+                print("[资源管理] 卸载语音模型，释放显存...")
+                try:
+                    clear_model_cache()
+                    # 执行垃圾回收
+                    import gc
+                    gc.collect()
+                    # 清空CUDA缓存
+                    if params['device'] != 'cpu':
+                        import torch
+                        torch.cuda.empty_cache()
+                    # 再次垃圾回收
+                    gc.collect()
+                    # 快速内存清理，减少等待时间
+                    print("[资源管理] 语音模型已卸载，内存已释放")
+                    self.log_message("[资源管理] 语音模型已卸载，内存已释放")
+                    
+                    # 内存管理：卸载模型后检查内存
+                    memory_status = self.get_gpu_memory()
+                    print(f"[内存管理] 卸载语音模型后GPU内存: 可用内存={memory_status['available']:.2f}GB")
+                except Exception as e:
+                    print(f"[错误信息] 卸载语音模型时出错: {str(e)}")
+                    self.log_message(f"[错误信息] 卸载语音模型时出错: {str(e)}")
+                
+                # 3. 翻译（如果源语言不是目标语言）
                 translated_text = recognized_text
                 translate_time = 0
-                if recognized_text['language'] != 'zh':
-                    print("[处理阶段] 3. 翻译日文...")
-                    self.log_message("\n3. 翻译日文...")
+                if recognized_text['language'] != target_language:
+                    print("[处理阶段] 3. 翻译...")
+                    self.log_message("\n3. 翻译...")
+                    
+                    # 重新获取当前系统的可用内存状态
+                    print("[内存管理] 重新获取系统可用内存状态...")
+                    memory_status = self.get_gpu_memory()
+                    print(f"[内存管理] 翻译前GPU内存: 可用内存={memory_status['available']:.2f}GB")
+                    
+                    # 使用用户设置的批处理大小
+                    translation_batch_size = params.get('translation_batch_size', DEFAULT_CONFIG["whisperx_params"].get("batch_size", 16))
+                    print(f"[内存管理] 使用用户设置的翻译模型批处理大小: {translation_batch_size}")
+                    self.log_message(f"[内存管理] 使用用户设置的翻译模型批处理大小: {translation_batch_size}")
+                    
                     start_time = time.time()
                     
                     try:
+                        # 传递目标语言到translate_text
+                        # 使用计算的翻译模型批处理大小
                         translated_text = translate_text(
                             recognized_text, 
                             translator_model, 
@@ -641,24 +860,80 @@ class QueueManager:
                             progress_callback=lambda progress: progress_callback(55 + progress * 0.25),
                             beam_size=params['translation_beam_size'],
                             max_length=params['translation_max_length'],
-                            early_stopping=params['translation_early_stopping']
+                            target_language=target_language,
+                            batch_size=translation_batch_size
                         )
                     except Exception as e:
-                        error_msg = f"翻译失败 - {str(e)}"
-                        print(f"[错误信息] {error_msg}")
-                        self.log_message(f"错误: {error_msg}")
-                        return False, f"翻译失败: {str(e)}", None, self.logs
+                        # 内存管理：如果是内存不足错误，尝试减小批处理大小
+                        if "out of memory" in str(e).lower():
+                            print("[内存管理] 检测到内存不足错误，尝试减小批处理大小...")
+                            self.log_message("[内存管理] 检测到内存不足错误，尝试减小批处理大小...")
+                            
+                            # 减小批处理大小并重新尝试
+                            reduced_batch_size = max(1, translation_batch_size // 2)
+                            print(f"[内存管理] 将批处理大小减小到: {reduced_batch_size}")
+                            self.log_message(f"[内存管理] 将批处理大小减小到: {reduced_batch_size}")
+                            
+                            try:
+                                translated_text = translate_text(
+                                    recognized_text, 
+                                    translator_model, 
+                                    device_choice=params['device'],
+                                    progress_callback=lambda progress: progress_callback(55 + progress * 0.25),
+                                    beam_size=params['translation_beam_size'],
+                                    max_length=params['translation_max_length'],
+                                    target_language=target_language,
+                                    batch_size=reduced_batch_size
+                                )
+                            except Exception as e2:
+                                error_msg = f"翻译失败 - {str(e2)}"
+                                print(f"[错误信息] {error_msg}")
+                                self.log_message(f"错误: {error_msg}")
+                                return False, f"翻译失败: {str(e2)}", None, self.logs
+                        else:
+                            error_msg = f"翻译失败 - {str(e)}"
+                            print(f"[错误信息] {error_msg}")
+                            self.log_message(f"错误: {error_msg}")
+                            return False, f"翻译失败: {str(e)}", None, self.logs
                     
                     translate_time = time.time() - start_time
                     translate_msg = f"翻译完成，耗时: {translate_time:.2f} 秒"
                     print(f"[处理结果] {translate_msg}")
                     self.log_message(translate_msg)
+                    
+                    # 内存管理：翻译后检查内存
+                    memory_status = self.get_gpu_memory()
+                    print(f"[内存管理] 翻译后GPU内存: 可用内存={memory_status['available']:.2f}GB")
                 else:
-                    skip_msg = "跳过翻译步骤，因为检测到的语言是中文"
+                    skip_msg = f"跳过翻译步骤，因为源语言和目标语言相同 ({target_language})"
                     print(f"[处理结果] {skip_msg}")
                     self.log_message(skip_msg)
                     # 更新进度
                     self.update_progress(80)
+                
+                # 卸载翻译模型，释放全部内存
+                print("[资源管理] 卸载翻译模型，释放全部内存...")
+                try:
+                    clear_translator_cache()
+                    # 执行垃圾回收
+                    import gc
+                    gc.collect()
+                    # 清空CUDA缓存
+                    if params['device'] != 'cpu':
+                        import torch
+                        torch.cuda.empty_cache()
+                    # 再次垃圾回收
+                    gc.collect()
+                    # 快速内存清理，减少等待时间
+                    print("[资源管理] 翻译模型已卸载，全部内存已释放")
+                    self.log_message("[资源管理] 翻译模型已卸载，全部内存已释放")
+                    
+                    # 内存管理：卸载模型后检查内存
+                    memory_status = self.get_gpu_memory()
+                    print(f"[内存管理] 卸载翻译模型后GPU内存: 可用内存={memory_status['available']:.2f}GB")
+                except Exception as e:
+                    print(f"[错误信息] 卸载翻译模型时出错: {str(e)}")
+                    self.log_message(f"[错误信息] 卸载翻译模型时出错: {str(e)}")
                 
                 # 更新进度
                 self.update_progress(80)
@@ -727,6 +1002,11 @@ class QueueManager:
                     gc.collect()
                     print("[资源管理] 已执行垃圾回收")
                     self.log_message("[资源管理] 已执行垃圾回收")
+                    
+                    # 内存管理：最终内存状态
+                    memory_status = self.get_gpu_memory()
+                    print(f"[内存管理] 最终GPU内存: 可用内存={memory_status['available']:.2f}GB")
+                    self.log_message(f"[内存管理] 最终GPU内存: 可用内存={memory_status['available']:.2f}GB")
                 except Exception as e:
                     print(f"[错误信息] 执行垃圾回收时出错: {str(e)}")
                     self.log_message(f"[错误信息] 执行垃圾回收时出错: {str(e)}")
@@ -736,9 +1016,9 @@ class QueueManager:
                 if os.path.exists(output_path):
                     success_msg = f"字幕生成完成: {output_path}"
                     print(f"[最终结果] {success_msg}")
-                    print("[最终结果] ✅ 处理成功！")
+                    print("[最终结果] 处理成功！")
                     self.log_message(success_msg)
-                    self.log_message("✅ 处理成功！")
+                    self.log_message("处理成功！")
                     message = "处理成功！"
                     print(f"[返回信息] 成功: {message}")
                     return True, message, output_path, self.logs
@@ -761,6 +1041,14 @@ class QueueManager:
                 print(f"[错误信息] {error_detail}")
                 self.log_message(f"[错误信息] {error_message}")
                 self.log_message(f"[错误信息] {error_detail}")
+                
+                # 内存管理：异常时清理内存
+                try:
+                    import gc
+                    gc.collect()
+                except Exception as e2:
+                    print(f"[错误信息] 异常时清理内存出错: {str(e2)}")
+                
                 return False, f"处理过程中出现错误: {str(e)}", None, self.logs
         except Exception as e:
             # 处理整体异常，只打印到终端，不显示在UI中
@@ -771,6 +1059,14 @@ class QueueManager:
             print(f"[错误信息] {error_detail}")
             self.log_message(f"[错误信息] {error_message}")
             self.log_message(f"[错误信息] {error_detail}")
+            
+            # 内存管理：异常时清理内存
+            try:
+                import gc
+                gc.collect()
+            except Exception as e2:
+                print(f"[错误信息] 异常时清理内存出错: {str(e2)}")
+            
             return False, "处理过程中出现错误", None, self.logs
     
     def process_queue(self):
@@ -937,6 +1233,13 @@ class QueueManager:
                     self.progress = 0
                 except:
                     pass
+                # 清理模型缓存，释放内存
+                try:
+                    print("[资源管理] 清理模型缓存...")
+                    clear_model_cache()
+                    clear_translator_cache()
+                except Exception as e:
+                    print(f"[错误信息] 清理模型缓存时出错：{str(e)}")
         except Exception as e:
             # 处理整体异常，只打印到终端，不显示在UI中
             import traceback
@@ -959,6 +1262,13 @@ class QueueManager:
                     self.progress = 0
                 except:
                     pass
+                # 清理模型缓存，释放内存
+                try:
+                    print("[资源管理] 清理模型缓存...")
+                    clear_model_cache()
+                    clear_translator_cache()
+                except Exception as e:
+                    print(f"[错误信息] 清理模型缓存时出错：{str(e)}")
             # UI消息为空
             yield [], "", "", 0, ""
 

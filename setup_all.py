@@ -7,8 +7,45 @@ print("Complete Setup - Subtitle Translation Tool")
 print("=" * 80)
 print()
 
-# Step 1: Setup FFmpeg
-print("Step 1: Setting up FFmpeg...")
+# Step 1: Setup aria2
+print("Step 1: Setting up aria2...")
+print("-" * 80)
+
+try:
+    sys.path.insert(0, os.getcwd())
+    from download_all_models import check_aria2_installed, find_aria2_path, download_and_install_aria2
+    
+    aria2_ok = check_aria2_installed()
+    aria2_path = find_aria2_path()
+    
+    if aria2_ok and aria2_path:
+        print(f"[OK] aria2 found at: {aria2_path}")
+        
+        # Test aria2
+        try:
+            if aria2_path == "aria2c":
+                result = subprocess.run(["aria2c", "--version"], capture_output=True, text=True)
+            else:
+                result = subprocess.run([aria2_path, "--version"], capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                print(f"[OK] aria2 version: {result.stdout.splitlines()[0]}")
+        except Exception as e:
+            print(f"[WARN] {e}")
+    else:
+        print("[INFO] aria2 not found, downloading...")
+        success = download_and_install_aria2()
+        if success:
+            print("[OK] aria2 installed successfully")
+        else:
+            print("[WARN] aria2 installation failed")
+except Exception as e:
+    print(f"[ERROR] Failed to setup aria2: {e}")
+
+print()
+
+# Step 2: Setup FFmpeg
+print("Step 2: Setting up FFmpeg...")
 print("-" * 80)
 
 ffmpeg_dir = os.path.join(os.getcwd(), "ffmpeg")
@@ -38,38 +75,6 @@ else:
             print(f"[WARN] FFmpeg download failed: {e}")
     else:
         print("[WARN] download_ffmpeg.py not found")
-
-print()
-
-# Step 2: Setup aria2
-print("Step 2: Setting up aria2...")
-print("-" * 80)
-
-try:
-    sys.path.insert(0, os.getcwd())
-    from download_all_models import check_aria2_installed, find_aria2_path
-    
-    aria2_ok = check_aria2_installed()
-    aria2_path = find_aria2_path()
-    
-    if aria2_ok and aria2_path:
-        print(f"[OK] aria2 found at: {aria2_path}")
-        
-        # Test aria2
-        try:
-            if aria2_path == "aria2c":
-                result = subprocess.run(["aria2c", "--version"], capture_output=True, text=True)
-            else:
-                result = subprocess.run([aria2_path, "--version"], capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                print(f"[OK] aria2 version: {result.stdout.splitlines()[0]}")
-        except Exception as e:
-            print(f"[WARN] {e}")
-    else:
-        print("[WARN] aria2 not available")
-except Exception as e:
-    print(f"[ERROR] Failed to setup aria2: {e}")
 
 print()
 

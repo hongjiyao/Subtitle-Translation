@@ -547,7 +547,6 @@ def download_and_install_aria2():
         # 下载源列表
         sources = [
             ("GitHub", "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip"),
-            ("阿里云镜像", "https://mirrors.aliyun.com/cygwin/x86_64/release/aria2/aria2-1.37.0-1.tar.xz"),
         ]
         
         success = False
