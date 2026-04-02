@@ -1,1094 +1,627 @@
-#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-视频转字幕工具 - 简洁现代的Gradio UI实现
-代码简单、功能丰富、方便调试
-所有调试信息和错误信息都会打印到终端
+字幕翻译工具 - Gradio UI
 """
+
 import os
 import sys
-import datetime
-
-# 确保在导入任何库之前设置HF-Mirror作为下载源
-# 这些环境变量需要在导入其他库之前设置
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-os.environ["HUGGINGFACE_ENDPOINT"] = "https://hf-mirror.com"
-os.environ["TRANSFORMERS_OFFLINE"] = "0"
-os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(os.path.dirname(__file__), "models")
-os.environ["HF_HOME"] = os.path.join(os.path.dirname(__file__), "models")
-
-# 导入必要的库
-import torch
-import warnings
-
-# 禁用特定的警告
-warnings.filterwarnings("ignore", category=UserWarning, message="Passing `gradient_checkpointing` to a config initialization is deprecated")
-
-# 启用TF32以提高性能
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-
-# 导入必要的库
-import json
 import gradio as gr
-from config import DEFAULT_CONFIG, TEMP_DIR, OUTPUT_DIR
+from pathlib import Path
+
+# 添加项目根目录到路径
+project_root = Path(__file__).parent
+sys.path.insert(0, str(project_root))
+
+from config import config, MODEL_OPTIONS, TRANSLATOR_MAP, LANGUAGE_OPTIONS, DEVICE_OPTIONS
 from utils.queue_manager import QueueManager
 
-# 确保必要的目录存在
-os.makedirs(TEMP_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# 全局配置
-class Config:
-    """应用配置类"""
-    # 翻译模型映射
-    translator_models = {
-        "m2m100_418M": "facebook/m2m100_418M",
-        "m2m100_1.2B": "facebook/m2m100_1.2B"
-    }
+def create_ui():
+    """创建Gradio界面"""
     
-    # 模型选项
-    model_options = ["tiny", "base", "small", "medium", "large-v2", "large-v3"]
-    translator_options = list(translator_models.keys())
+    # 获取配置值
+    cfg = config.ui_values()
+    all_config = config.get_all()
     
-    # 支持的语言选项 (Whisper和M2M100支持的常见语言)
-    language_options = [
-        ("auto", "自动检测"),
-        ("zh", "中文"),
-        ("en", "英语"),
-        ("ja", "日语"),
-        ("ko", "韩语"),
-        ("fr", "法语"),
-        ("de", "德语"),
-        ("es", "西班牙语"),
-        ("ru", "俄语"),
-        ("ar", "阿拉伯语"),
-        ("hi", "印地语"),
-        ("pt", "葡萄牙语"),
-        ("it", "意大利语"),
-        ("nl", "荷兰语"),
-        ("pl", "波兰语")
-    ]
+    # 创建队列管理器实例
+    queue_manager = QueueManager()
     
-    # 语言代码到名称的映射
-    language_names = dict(language_options)
-    
-    # 默认语言设置
-    default_source_language = "auto"
-    default_target_language = "zh"
-    
-    # 默认语言选择模式 (auto_detect/manual)
-    default_language_mode = "auto_detect"
-    
-    # 参数保存文件
-    params_file = os.path.join(os.path.dirname(__file__), "saved_params.json")
-
-# 工具函数
-class Utils:
-    """工具函数类"""
-    @staticmethod
-    def timestamp_print(message):
-        """带时间戳的打印函数"""
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{timestamp}] {message}")
-    
-    @staticmethod
-    def process_video_files(video_files):
-        """处理视频文件输入，支持多种格式"""
-        # 确保video_files是列表
-        if isinstance(video_files, str):
-            video_files = [video_files]
-        elif not isinstance(video_files, list):
-            return []
+    with gr.Blocks(title="字幕翻译工具") as demo:
         
-        # 处理文件对象格式
-        processed_files = []
-        for file_item in video_files:
-            if isinstance(file_item, str):
-                processed_files.append(file_item)
-            elif hasattr(file_item, 'name'):
-                processed_files.append(file_item.name)
-            elif isinstance(file_item, dict) and 'path' in file_item:
-                processed_files.append(file_item['path'])
-            elif isinstance(file_item, dict) and 'name' in file_item:
-                processed_files.append(file_item['name'])
+        gr.Markdown("# 🎬 字幕翻译工具")
+        gr.Markdown("自动语音识别 + AI翻译，生成高质量字幕文件")
         
-        return processed_files
-
-# 全局实例
-config = Config()
-utils = Utils()
-queue_manager = QueueManager()
-
-# 参数管理
-class ParameterManager:
-    """参数管理类"""
-    @staticmethod
-    def save_params(model, translator, beam_size, vad_filter, word_timestamps, 
-                   condition_on_previous_text, translation_beam_size, 
-                   translation_max_length, device, 
-                   source_language, target_language, language_mode,
-                   speech_batch_size, translation_batch_size, vad_threshold, 
-                   vad_min_speech, vad_max_speech, vad_min_silence):
-        """保存当前参数设置"""
-        try:
-            # 转换语言模式为内部值
-            internal_language_mode = "auto_detect" if language_mode == "自动检测" else "manual"
+        with gr.Tabs():
+            # 第一个标签页：视频处理
+            with gr.TabItem("视频处理"):
+                with gr.Row():
+                    # 左侧：输入和配置
+                    with gr.Column(scale=1):
+                        video_input = gr.File(
+                            label="上传视频文件",
+                            file_types=[".mp4", ".avi", ".mov", ".mkv", ".webm"],
+                            type="filepath"
+                        )
+                        
+                        # 处理按钮
+                        process_btn = gr.Button("开始处理", variant="primary", size="lg")
+                        
+                        # 队列管理按钮
+                        with gr.Row():
+                            add_queue_btn = gr.Button("添加到队列", variant="secondary")
+                            clear_queue_btn = gr.Button("清空队列", variant="secondary")
+                        
+                        # 状态显示
+                        status_msg = gr.Textbox(label="状态", interactive=False, lines=3)
+                    
+                    # 右侧：队列和输出
+                    with gr.Column(scale=1):
+                        # 队列列表
+                        gr.Markdown("### 处理队列")
+                        queue_list = gr.Dataframe(
+                            headers=["ID", "文件", "状态", "进度"],
+                            label="队列",
+                            interactive=False
+                        )
+                        
+                        # 处理队列按钮
+                        process_queue_btn = gr.Button("处理队列", variant="primary")
+                        
+                        # 输出文件
+                        output_files = gr.File(label="输出文件", interactive=False)
+                        
+                        # 语言检测结果显示
+                        lang_mode = gr.Textbox(
+                            label="语言检测模式",
+                            value="自动检测" if all_config.get('source_language') == 'auto' else "手动选择",
+                            interactive=False
+                        )
             
-            # 安全地转换参数
-            def safe_int(value, default):
-                try:
-                    return int(value) if value else default
-                except (ValueError, TypeError):
-                    return default
+            # 第二个标签页：详细配置
+            with gr.TabItem("详细配置"):
+                with gr.Column():
+                    gr.Markdown("### 详细参数配置")
+                    
+                    # =========================================================================
+                    # 1. 模型与设备配置 (Model & Device Settings)
+                    # =========================================================================
+                    
+                    with gr.Accordion("1. 模型与设备配置", open=True):
+                        model_config = gr.Dropdown(
+                            label="识别模型",
+                            choices=MODEL_OPTIONS,
+                            value=all_config.get('model', 'medium'),
+                            interactive=True
+                        )
+                        translator_config = gr.Dropdown(
+                            label="翻译模型",
+                            choices=list(TRANSLATOR_MAP.keys()),
+                            value=cfg[1],
+                            interactive=True
+                        )
+                        translator_quantization = gr.Dropdown(
+                            label="翻译模型量化版本",
+                            choices=["auto", "Q4_K_M", "Q6_K", "Q8_0"],
+                            value=all_config.get('translator_quantization', 'Q6_K'),
+                            interactive=True
+                        )
+                        device_config = gr.Dropdown(
+                            label="计算设备",
+                            choices=DEVICE_OPTIONS,
+                            value=all_config.get('device', 'auto'),
+                            interactive=True
+                        )
+                        source_language_config = gr.Dropdown(
+                            label="源语言",
+                            choices=[l[0] for l in LANGUAGE_OPTIONS],
+                            value=all_config.get('source_language', 'auto'),
+                            interactive=True
+                        )
+                        target_language_config = gr.Dropdown(
+                            label="目标语言",
+                            choices=[l[0] for l in LANGUAGE_OPTIONS],
+                            value=all_config.get('target_language', 'zh'),
+                            interactive=True
+                        )
+                    
+                    # =========================================================================
+                    # 2. 语音识别配置 (Speech Recognition Settings)
+                    # =========================================================================
+                    
+                    with gr.Accordion("2. 语音识别配置", open=False):
+                        vad_filter_config = gr.Checkbox(
+                            label="启用VAD语音活动检测",
+                            value=all_config.get('vad_filter', True),
+                            interactive=True
+                        )
+                        word_timestamps_config = gr.Checkbox(
+                            label="生成单词级时间戳",
+                            value=all_config.get('word_timestamps', True),
+                            interactive=True
+                        )
+                        speech_batch_size_config = gr.Slider(
+                            label="语音识别批处理大小",
+                            minimum=1,
+                            maximum=64,
+                            value=all_config.get('speech_batch_size', 10),
+                            step=1,
+                            interactive=True
+                        )
+                        use_whisperx_config = gr.Checkbox(
+                            label="使用WhisperX",
+                            value=all_config.get('use_whisperx', True),
+                            interactive=True
+                        )
+                    
+                    with gr.Accordion("WhisperX VAD配置", open=False):
+                        whisperx_chunk_size = gr.Slider(
+                            label="VAD分段大小(秒)",
+                            minimum=10,
+                            maximum=60,
+                            value=all_config.get('whisperx_chunk_size', 30),
+                            step=5,
+                            interactive=True
+                        )
+                        whisperx_vad_onset = gr.Slider(
+                            label="VAD起始阈值",
+                            minimum=0.0,
+                            maximum=1.0,
+                            value=all_config.get('whisperx_vad_onset', 0.3),
+                            step=0.1,
+                            interactive=True
+                        )
+                        whisperx_vad_offset = gr.Slider(
+                            label="VAD结束阈值",
+                            minimum=0.0,
+                            maximum=1.0,
+                            value=all_config.get('whisperx_vad_offset', 0.3),
+                            step=0.1,
+                            interactive=True
+                        )
+                        whisperx_compute_type = gr.Dropdown(
+                            label="计算类型",
+                            choices=["float16", "float32", "int8"],
+                            value=all_config.get('whisperx_compute_type', 'float16'),
+                            interactive=True
+                        )
+                        whisperx_condition_on_previous_text = gr.Checkbox(
+                            label="基于前文条件预测",
+                            value=all_config.get('whisperx_condition_on_previous_text', False),
+                            interactive=True
+                        )
+                    
+                    with gr.Accordion("WhisperX 文本处理配置", open=False):
+                        whisperx_suppress_punctuation = gr.Checkbox(
+                            label="抑制标点符号",
+                            value=all_config.get('whisperx_suppress_punctuation', True),
+                            interactive=True
+                        )
+                        whisperx_suppress_tokens = gr.Textbox(
+                            label="抑制特定token",
+                            value=all_config.get('whisperx_suppress_tokens', "-1"),
+                            placeholder="-1表示不抑制，多个token用逗号分隔，如'1231,171'",
+                            interactive=True
+                        )
+                        whisperx_initial_prompt = gr.Textbox(
+                            label="初始提示文本",
+                            value=all_config.get('whisperx_initial_prompt', ""),
+                            placeholder="为模型提供上下文提示，可提高特定领域识别率",
+                            interactive=True
+                        )
+                        whisperx_hotwords = gr.Textbox(
+                            label="热词/提示词",
+                            value=all_config.get('whisperx_hotwords', ""),
+                            placeholder="专业术语，用逗号分隔，如: WhisperX, PyAnnote, GPU",
+                            interactive=True
+                        )
+                    
+                    # =========================================================================
+                    # 3. 翻译配置 (Translation Settings)
+                    # =========================================================================
+                    
+                    with gr.Accordion("3. 翻译配置", open=False):
+                        translation_batch_size = gr.Slider(
+                            label="翻译批处理大小",
+                            minimum=1024,
+                            maximum=8192,
+                            value=all_config.get('translation_batch_size', 7096),
+                            step=512,
+                            interactive=True
+                        )
+                        translation_context_size = gr.Slider(
+                            label="翻译模型上下文大小",
+                            minimum=1024,
+                            maximum=32768,
+                            value=all_config.get('translation_context_size', 9000),
+                            step=1024,
+                            interactive=True
+                        )
+                        translation_temperature = gr.Slider(
+                            label="温度参数",
+                            minimum=0.0,
+                            maximum=2.0,
+                            value=all_config.get('translation_temperature', 0.3),
+                            step=0.1,
+                            interactive=True
+                        )
+                        translation_top_k = gr.Slider(
+                            label="Top-K采样",
+                            minimum=1,
+                            maximum=100,
+                            value=all_config.get('translation_top_k', 20),
+                            step=5,
+                            interactive=True
+                        )
+                        translation_top_p = gr.Slider(
+                            label="Top-P采样",
+                            minimum=0.0,
+                            maximum=1.0,
+                            value=all_config.get('translation_top_p', 0.6),
+                            step=0.1,
+                            interactive=True
+                        )
+                        translation_repetition_penalty = gr.Slider(
+                            label="重复惩罚",
+                            minimum=1.0,
+                            maximum=2.0,
+                            value=all_config.get('translation_repetition_penalty', 1.05),
+                            step=0.05,
+                            interactive=True
+                        )
+                    
+                    # =========================================================================
+                    # 4. 增强版语音识别配置 (Enhanced Speech Recognition Settings)
+                    # =========================================================================
+                    
+                    with gr.Accordion("4. 增强版语音识别配置", open=False):
+                        enable_forced_alignment_config = gr.Checkbox(
+                            label="启用强制对齐",
+                            value=all_config.get('enable_forced_alignment', True),
+                            interactive=True
+                        )
+                        max_segment_duration = gr.Slider(
+                            label="最大段落持续时间(秒)",
+                            minimum=1.0,
+                            maximum=30.0,
+                            value=all_config.get('max_segment_duration', 10.0),
+                            step=1.0,
+                            interactive=True
+                        )
+                        sentence_pause_threshold = gr.Slider(
+                            label="句子停顿阈值(秒)",
+                            minimum=0.1,
+                            maximum=2.0,
+                            value=all_config.get('sentence_pause_threshold', 0.5),
+                            step=0.1,
+                            interactive=True
+                        )
+                        min_silence_for_split = gr.Slider(
+                            label="断句所需最小静音时长(秒)",
+                            minimum=0.1,
+                            maximum=1.0,
+                            value=all_config.get('min_silence_for_split', 0.3),
+                            step=0.1,
+                            interactive=True
+                        )
+                    
+                    # 配置保存和重置
+                    with gr.Row():
+                        save_all_btn = gr.Button("保存所有参数", variant="primary")
+                        reset_all_btn = gr.Button("恢复默认配置", variant="secondary")
+                    
+                    # 配置状态显示
+                    with gr.Accordion("配置状态", open=False):
+                        config_info = gr.JSON(label="当前配置", value=config.get_all())
+                        refresh_btn = gr.Button("刷新状态")
+                        refresh_btn.click(fn=lambda: config.get_all(), outputs=[config_info])
+                    
+                    gr.Markdown("**提示**: 只保存与默认值不同的参数")
             
-            beam_size = safe_int(beam_size, DEFAULT_CONFIG["speech_recognition_params"]["beam_size"])
-            translation_beam_size = safe_int(translation_beam_size, DEFAULT_CONFIG["translation_params"]["beam_size"])
-            translation_max_length = safe_int(translation_max_length, DEFAULT_CONFIG["translation_params"]["max_length"])
-            speech_batch_size = safe_int(speech_batch_size, DEFAULT_CONFIG["whisperx_params"].get("batch_size", 16))
-            translation_batch_size = safe_int(translation_batch_size, DEFAULT_CONFIG["whisperx_params"].get("batch_size", 16))
-            
+            # 第三个标签页：参数说明
+            with gr.TabItem("参数说明"):
+                gr.Markdown("### 参数功能详细说明")
+                
+                # =========================================================================
+                # 1. 模型与设备配置说明
+                # =========================================================================
+                with gr.Accordion("1. 模型与设备配置", open=True):
+                    gr.Markdown("""
+                    #### 识别模型
+                    - **tiny**: 最小模型，速度最快，准确率最低
+                    - **base**: 基础模型，平衡速度和准确率
+                    - **small**: 小型模型，准确率较高
+                    - **medium**: 中型模型，推荐使用
+                    - **large-v2**: 大型模型，准确率高，速度慢
+                    - **large-v3**: 最新大型模型，准确率最高
+                    
+                    #### 翻译模型
+                    - 支持多种翻译模型
+                    - 根据需求选择合适的模型
+                    
+                    #### 翻译模型量化版本
+                    - **auto**: 自动选择最小模型
+                    - **Q4_K_M**: 4位量化，平衡大小和性能
+                    - **Q6_K**: 6位量化，默认选项，更好的质量
+                    - **Q8_0**: 8位量化，最高质量，最大模型大小
+                    
+                    #### 计算设备
+                    - **auto**: 自动检测GPU可用性，优先使用GPU
+                    - **cuda**: 强制使用GPU
+                    - **cpu**: 强制使用CPU
+                    - 推荐使用GPU以获得最佳性能
+                    
+                    #### 源语言和目标语言
+                    - 源语言：自动检测或手动指定
+                    - 目标语言：选择翻译输出的语言
+                    - 手动指定源语言可提高识别准确率
+                    """)
+                
+                # =========================================================================
+                # 2. 语音识别配置说明
+                # =========================================================================
+                with gr.Accordion("2. 语音识别配置", open=False):
+                    gr.Markdown("""
+                    #### 基础语音识别配置
+                    - **启用VAD语音活动检测**: 启用后可以过滤掉静音部分，提高识别精度
+                    - **生成单词级时间戳**: 启用后会为每个单词生成时间戳，提高字幕准确性
+                    - **语音识别批处理大小**: 控制每次处理的音频批次大小，根据GPU显存调整
+                    - **使用WhisperX**: 使用WhisperX替代原版Whisper，提供更好的时间戳精度
+                    
+                    #### WhisperX VAD配置
+                    - **VAD分段大小**: 控制VAD处理的分段大小（秒），推荐值：30
+                    - **VAD起始阈值**: 控制语音检测的灵敏度，推荐值：0.3
+                    - **VAD结束阈值**: 控制语音结束的检测，推荐值：0.3
+                    - **计算类型**: 控制计算精度，float16平衡速度和精度（推荐）
+                    - **基于前文条件预测**: 使用前文信息辅助识别，提高连续性
+                    
+                    #### WhisperX 文本处理配置
+                    - **抑制标点符号**: 启用后可减少标点符号的识别
+                    - **抑制特定token**: 抑制指定的token，多个用逗号分隔
+                    - **初始提示文本**: 为模型提供上下文提示，可提高特定领域识别率
+                    - **热词/提示词**: 专业术语，用逗号分隔，提高专业术语识别率
+                    """)
+                
+                # =========================================================================
+                # 3. 翻译配置说明
+                # =========================================================================
+                with gr.Accordion("3. 翻译配置", open=False):
+                    gr.Markdown("""
+                    #### 翻译批处理与上下文配置
+                    - **翻译批处理大小**: 控制每次翻译的批次大小，推荐值：4096-8192
+                    - **翻译模型上下文大小**: 控制翻译模型的上下文窗口大小，推荐值：4096-9000
+                    
+                    #### 翻译采样配置
+                    - **温度参数**: 控制输出的随机性，字幕翻译建议0.2-0.4
+                    - **Top-K采样**: 限制采样范围为概率最高的K个token，推荐值：20
+                    - **Top-P采样**: 核采样，累积概率超过P的token都被考虑，推荐值：0.6-0.9
+                    - **重复惩罚**: 抑制重复生成，字幕翻译建议1.02-1.1
+                    """)
+                
+                # =========================================================================
+                # 4. 增强版语音识别配置说明
+                # =========================================================================
+                with gr.Accordion("4. 增强版语音识别配置", open=False):
+                    gr.Markdown("""
+                    #### 强制对齐与段落分割配置
+                    - **启用强制对齐**: 使用Wav2Vec2/CTC进行强制对齐，提高时间戳精度
+                    - **最大段落持续时间**: 超过此值的段落会被分割，推荐值：8-10秒
+                    - **句子停顿阈值**: 用于检测句子边界的停顿时间
+                    - **断句所需最小静音时长**: 低于此值的静音不会触发断句，推荐值：0.3秒
+                    """)
+        
+        # 事件处理
+        # 队列管理
+        def add_to_queue(video):
+            if not video:
+                return queue_manager.get_queue(), "请先上传视频文件"
             params = {
-                "model": model,
-                "translator": translator,
-                "beam_size": beam_size,
-                "vad_filter": vad_filter,
-                "word_timestamps": word_timestamps,
-                "condition_on_previous_text": condition_on_previous_text,
-                "translation_beam_size": translation_beam_size,
-                "translation_max_length": translation_max_length,
-                "device": device,
-                "source_language": source_language,
-                "target_language": target_language,
-                "language_mode": internal_language_mode,
-                "use_whisperx": True,  # 默认启用WhisperX
-                "speech_batch_size": speech_batch_size,
-                "translation_batch_size": translation_batch_size,
-                "vad_threshold": vad_threshold,
-                "vad_min_speech": vad_min_speech,
-                "vad_max_speech": vad_max_speech,
-                "vad_min_silence": vad_min_silence
+                'model': all_config.get('model', 'medium'),
+                'translator': all_config.get('translator', 'tencent/HY-MT1.5-7B-GGUF'),
+                'source_language': all_config.get('source_language', 'auto'),
+                'target_language': all_config.get('target_language', 'zh'),
+                'device': all_config.get('device', 'auto'),
+                'output_path': None,
+                'word_timestamps': all_config.get('word_timestamps', True),
+                'speech_batch_size': all_config.get('speech_batch_size', 16),
+                'whisperx_vad_onset': all_config.get('whisperx_vad_onset', 0.3),
+                'enable_forced_alignment': all_config.get('enable_forced_alignment', True),
+                'translation_batch_size': all_config.get('translation_batch_size', 4096),
+                'translation_context_size': all_config.get('translation_context_size', 4096)
             }
-            
-            with open(config.params_file, "w", encoding="utf-8") as f:
-                json.dump(params, f, indent=2, ensure_ascii=False)
-            
-            utils.timestamp_print(f"[参数保存] 成功保存参数到 {config.params_file}")
-            return "参数保存成功！"
-        except Exception as e:
-            error_msg = f"保存参数时出错: {str(e)}"
-            utils.timestamp_print(f"[错误信息] {error_msg}")
-            return "保存失败：" + str(e)
-    
-    @staticmethod
-    def load_params():
-        """加载保存的参数设置"""
-        try:
-            if os.path.exists(config.params_file):
-                with open(config.params_file, "r", encoding="utf-8") as f:
-                    params = json.load(f)
-                
-                utils.timestamp_print(f"[参数加载] 成功从 {config.params_file} 加载参数")
-                # 转换语言模式为UI值
-                internal_language_mode = params.get("language_mode", config.default_language_mode)
-                ui_language_mode = "自动检测" if internal_language_mode == "auto_detect" else "手动选择"
-                
-                return (
-                    params.get("model"),
-                    params.get("translator"),
-                    params.get("beam_size"),
-                    params.get("vad_filter"),
-                    params.get("word_timestamps"),
-                    params.get("condition_on_previous_text"),
-                    params.get("translation_beam_size"),
-                    params.get("translation_max_length"),
-                    params.get("device"),
-                    params.get("source_language", config.default_source_language),
-                    params.get("target_language", config.default_target_language),
-                    ui_language_mode,
-                    params.get("speech_batch_size", 16),
-                    params.get("translation_batch_size", 16),
-                    params.get("vad_threshold", 0.5),
-                    params.get("vad_min_speech", 250),
-                    params.get("vad_max_speech", 30),
-                    params.get("vad_min_silence", 100)
-                )
+            count = queue_manager.add_to_queue(video, params)
+            return queue_manager.get_queue(), f"已添加 {count} 个文件到队列"
+        
+        def clear_queue():
+            queue_manager.clear_queue()
+            return queue_manager.get_queue(), "队列已清空"
+        
+        def process_queue():
+            if not queue_manager.video_queue:
+                return queue_manager.get_queue(), "队列为空"
+            # 处理队列中的第一个文件
+            item = queue_manager.video_queue[0]
+            item['status'] = '处理中'
+            success, msg, output, logs = queue_manager.process_video(item['file_path'], item['params'])
+            if success:
+                item['status'] = '完成'
             else:
-                utils.timestamp_print("[参数加载] 没有找到保存的参数文件")
-                return None
-        except Exception as e:
-            error_msg = f"加载参数时出错: {str(e)}"
-            utils.timestamp_print(f"[错误信息] {error_msg}")
-            return None
-    
-    @staticmethod
-    def reset_to_default():
-        """恢复默认参数设置"""
-        utils.timestamp_print("[参数重置] 恢复默认参数设置")
-        # 转换语言模式为UI值
-        ui_language_mode = "自动检测" if config.default_language_mode == "auto_detect" else "手动选择"
-        return (
-                DEFAULT_CONFIG["speech_recognition_model"],
-                "m2m100_418M",
-                DEFAULT_CONFIG["speech_recognition_params"]["beam_size"],
-                DEFAULT_CONFIG["speech_recognition_params"]["vad_filter"],
-                DEFAULT_CONFIG["speech_recognition_params"]["word_timestamps"],
-                DEFAULT_CONFIG["speech_recognition_params"]["condition_on_previous_text"],
-                DEFAULT_CONFIG["translation_params"]["beam_size"],
-                DEFAULT_CONFIG["translation_params"]["max_length"],
-                DEFAULT_CONFIG["device"],
-                config.default_source_language,
-                config.default_target_language,
-                ui_language_mode,
-                DEFAULT_CONFIG["whisperx_params"].get("batch_size", 16),
-                DEFAULT_CONFIG["whisperx_params"].get("batch_size", 16),
-                0.5,  # 默认VAD阈值
-                250,  # 默认最小语音持续时间
-                30,   # 默认最大语音持续时间
-                100   # 默认最小沉默持续时间
-            )
-
-# 队列管理
-class QueueManagerUI:
-    """队列管理UI类"""
-    @staticmethod
-    def add_to_queue(video_files, model, translator, beam_size, vad_filter, 
-                    word_timestamps, condition_on_previous_text, 
-                    translation_beam_size, translation_max_length, 
-                    device, source_language, target_language, language_mode,
-                    speech_batch_size, translation_batch_size, vad_threshold, 
-                    vad_min_speech, vad_max_speech, vad_min_silence):
-        """添加文件到队列"""
-        # 打印所有UI信息到终端
-        utils.timestamp_print("\n" + "="*80)
-        utils.timestamp_print("[UI信息] 用户执行了'添加到队列'操作")
-        utils.timestamp_print("[UI信息] 选择的视频文件:")
+                item['status'] = f'失败: {msg}'
+            return queue_manager.get_queue(), "\n".join(logs)
         
-        # 处理视频文件
-        processed_files = utils.process_video_files(video_files)
-        if not processed_files:
-            return [], "请选择视频文件"
+        add_queue_btn.click(
+            fn=add_to_queue,
+            inputs=[video_input],
+            outputs=[queue_list, status_msg]
+        )
+        clear_queue_btn.click(fn=clear_queue, outputs=[queue_list, status_msg])
+        process_btn.click(fn=process_queue, outputs=[queue_list, status_msg])
         
-        for i, file in enumerate(processed_files):
-            utils.timestamp_print(f"  {i+1}. {file}")
-        
-        utils.timestamp_print(f"[UI信息] 使用的模型: {model}")
-        utils.timestamp_print(f"[UI信息] 使用的翻译模型: {translator}")
-        utils.timestamp_print(f"[UI信息] 使用的设备: {device}")
-        utils.timestamp_print(f"[UI信息] VAD filter: {vad_filter}")
-        utils.timestamp_print(f"[UI信息] Word timestamps: {word_timestamps}")
-        utils.timestamp_print(f"[UI信息] Condition on previous text: {condition_on_previous_text}")
-        utils.timestamp_print(f"[UI信息] 源语言: {source_language} ({config.language_names.get(source_language, source_language)})")
-        utils.timestamp_print(f"[UI信息] 目标语言: {target_language} ({config.language_names.get(target_language, target_language)})")
-        utils.timestamp_print(f"[UI信息] 语言模式: {language_mode}")
-        utils.timestamp_print(f"[UI信息] 语音模型批处理大小: {speech_batch_size}")
-        utils.timestamp_print(f"[UI信息] 翻译模型批处理大小: {translation_batch_size}")
-        utils.timestamp_print(f"[UI信息] VAD阈值: {vad_threshold}")
-        utils.timestamp_print(f"[UI信息] 最小语音持续时间: {vad_min_speech}ms")
-        utils.timestamp_print(f"[UI信息] 最大语音持续时间: {vad_max_speech}s")
-        utils.timestamp_print(f"[UI信息] 最小沉默持续时间: {vad_min_silence}ms")
-        utils.timestamp_print("="*80)
-        
-        try:
-            # 转换语言模式为内部值
-            internal_language_mode = "auto_detect" if language_mode == "自动检测" else "manual"
+        # 保存所有参数
+        def do_save_all(model, translator, translator_quantization, device, source_language, target_language,
+                       vad_filter, word_timestamps, speech_batch_size, use_whisperx,
+                       whisperx_chunk_size, whisperx_vad_onset, whisperx_vad_offset, whisperx_compute_type,
+                       whisperx_condition_on_previous_text, whisperx_suppress_punctuation, whisperx_suppress_tokens,
+                       whisperx_initial_prompt, whisperx_hotwords,
+                       translation_batch_size, translation_context_size, translation_temperature,
+                       translation_top_k, translation_top_p, translation_repetition_penalty,
+                       enable_forced_alignment, max_segment_duration, sentence_pause_threshold, min_silence_for_split):
             
-            # 构建参数字典
-            # 将翻译模型选项映射到完整的模型路径
-            translator_model = config.translator_models.get(translator, translator)
-            
-            # 安全地转换参数
-            def safe_int(value, default):
-                try:
-                    return int(value) if value else default
-                except (ValueError, TypeError):
-                    return default
-            
-            beam_size = safe_int(beam_size, DEFAULT_CONFIG["speech_recognition_params"]["beam_size"])
-            translation_beam_size = safe_int(translation_beam_size, DEFAULT_CONFIG["translation_params"]["beam_size"])
-            translation_max_length = safe_int(translation_max_length, DEFAULT_CONFIG["translation_params"]["max_length"])
-            speech_batch_size = safe_int(speech_batch_size, DEFAULT_CONFIG["whisperx_params"].get("batch_size", 16))
-            translation_batch_size = safe_int(translation_batch_size, DEFAULT_CONFIG["whisperx_params"].get("batch_size", 16))
-            
-            params = {
+            # 构建所有参数
+            all_params = {
                 'model': model,
-                'translator': translator_model,
-                'beam_size': beam_size,
-                'vad_filter': vad_filter,
-                'word_timestamps': word_timestamps,
-                'condition_on_previous_text': condition_on_previous_text,
-                'translation_beam_size': translation_beam_size,
-                'translation_max_length': translation_max_length,
+                'translator': translator,
+                'translator_quantization': translator_quantization,
                 'device': device,
                 'source_language': source_language,
                 'target_language': target_language,
-                'language_mode': internal_language_mode,
-                'use_whisperx': True,  # 默认启用WhisperX
+                'vad_filter': vad_filter,
+                'word_timestamps': word_timestamps,
                 'speech_batch_size': speech_batch_size,
+                'use_whisperx': use_whisperx,
+                'whisperx_chunk_size': whisperx_chunk_size,
+                'whisperx_vad_onset': whisperx_vad_onset,
+                'whisperx_vad_offset': whisperx_vad_offset,
+                'whisperx_compute_type': whisperx_compute_type,
+                'whisperx_condition_on_previous_text': whisperx_condition_on_previous_text,
+                'whisperx_suppress_punctuation': whisperx_suppress_punctuation,
+                'whisperx_suppress_tokens': whisperx_suppress_tokens,
+                'whisperx_initial_prompt': whisperx_initial_prompt,
+                'whisperx_hotwords': whisperx_hotwords,
                 'translation_batch_size': translation_batch_size,
-                'vad_threshold': vad_threshold,
-                'vad_min_speech_duration_ms': vad_min_speech,
-                'vad_max_speech_duration_s': vad_max_speech,
-                'vad_min_silence_duration_ms': vad_min_silence
+                'translation_context_size': translation_context_size,
+                'translation_temperature': translation_temperature,
+                'translation_top_k': translation_top_k,
+                'translation_top_p': translation_top_p,
+                'translation_repetition_penalty': translation_repetition_penalty,
+                'enable_forced_alignment': enable_forced_alignment,
+                'max_segment_duration': max_segment_duration,
+                'sentence_pause_threshold': sentence_pause_threshold,
+                'min_silence_for_split': min_silence_for_split
             }
-            utils.timestamp_print(f"[UI信息] 映射后的翻译模型: {translator_model}")
             
-            # 使用QueueManager添加文件到队列
-            added_count = queue_manager.add_to_queue(processed_files, params)
+            # 保存参数
+            success, msg = config.save(**all_params)
             
-            # 获取队列状态
-            queue_items = queue_manager.get_queue()
-            queue_data = QueueManagerUI.get_queue_status()
-            status_message = f"成功添加 {added_count} 个文件到队列"
-            
-            return queue_data, status_message
-        except Exception as e:
-            # 处理整体异常
-            error_msg = f"添加文件到队列时出错: {str(e)}"
-            utils.timestamp_print(f"[错误信息] {error_msg}")
-            return [], "添加失败：" + str(e)
-    
-    @staticmethod
-    def remove_from_queue(index):
-        """从队列删除文件"""
-        # 打印所有UI信息到终端
-        utils.timestamp_print("\n" + "="*80)
-        utils.timestamp_print("[UI信息] 用户执行了'从队列删除'操作")
-        utils.timestamp_print(f"[UI信息] 删除索引: {index}")
-        utils.timestamp_print("="*80)
+            # 刷新配置信息
+            return msg, config.get_all()
         
-        try:
-            # 处理不同类型的索引输入
-            if isinstance(index, str):
-                index = index.strip()
-                if not index.isdigit():
-                    queue_data = QueueManagerUI.get_queue_status()
-                    return queue_data, "请输入有效的数字索引"
-                index = int(index)
-            elif not isinstance(index, (int, float)):
-                queue_data = QueueManagerUI.get_queue_status()
-                return queue_data, "索引必须是数字"
-            else:
-                index = int(index)
-            
-            # 使用QueueManager从队列删除文件
-            queue_manager.remove_from_queue(index)
-            
-            # 获取更新后的队列状态
-            queue_data = QueueManagerUI.get_queue_status()
-            return queue_data, f"已删除索引为 {index} 的文件"
-        except Exception as e:
-            # 处理整体异常
-            error_msg = f"从队列删除文件时出错: {str(e)}"
-            utils.timestamp_print(f"[错误信息] {error_msg}")
-            queue_data = QueueManagerUI.get_queue_status()
-            return queue_data, "删除失败：" + str(e)
-    
-    @staticmethod
-    def clear_queue():
-        """清空队列"""
-        # 打印所有UI信息到终端
-        utils.timestamp_print("\n" + "="*80)
-        utils.timestamp_print("[UI信息] 用户执行了'清空队列'操作")
-        utils.timestamp_print("="*80)
+        save_all_btn.click(
+            fn=do_save_all,
+            inputs=[
+                model_config, translator_config, translator_quantization, device_config,
+                source_language_config, target_language_config,
+                vad_filter_config, word_timestamps_config, speech_batch_size_config, use_whisperx_config,
+                whisperx_chunk_size, whisperx_vad_onset, whisperx_vad_offset, whisperx_compute_type,
+                whisperx_condition_on_previous_text, whisperx_suppress_punctuation, whisperx_suppress_tokens,
+                whisperx_initial_prompt, whisperx_hotwords,
+                translation_batch_size, translation_context_size, translation_temperature,
+                translation_top_k, translation_top_p, translation_repetition_penalty,
+                enable_forced_alignment_config, max_segment_duration, sentence_pause_threshold, min_silence_for_split
+            ],
+            outputs=[status_msg, config_info]
+        )
         
-        try:
-            # 使用QueueManager清空队列
-            cleared_count = queue_manager.clear_queue()
+        # 恢复默认配置
+        def do_reset_all():
+            success, msg = config.reset()
             
-            if cleared_count > 0:
-                return [], f"队列已清空，共删除 {cleared_count} 个文件"
-            else:
-                return [], "队列为空"
-        except Exception as e:
-            # 处理异常
-            error_msg = f"清空队列时出错: {str(e)}"
-            utils.timestamp_print(f"[错误信息] {error_msg}")
-            return [], "清空失败：" + str(e)
-    
-    @staticmethod
-    def get_queue_status():
-        """获取队列状态"""
-        queue_items = queue_manager.get_queue()
-        return [[item['filename'], item['status']] for item in queue_items]
-    
-    @staticmethod
-    def process_queue():
-        """处理队列中的所有视频文件"""
-        # 打印所有UI信息到终端
-        utils.timestamp_print("\n" + "="*80)
-        utils.timestamp_print("[UI信息] 用户执行了'开始处理队列'操作")
-        utils.timestamp_print("="*80)
-        
-        try:
-            # 获取当前队列状态
-            queue_items = queue_manager.get_queue()
-            if not queue_items:
-                yield [], "队列为空，没有文件可处理"
-                return
+            # 获取默认配置值
+            default_config = config.get_all()
             
-            # 使用QueueManager的process_queue方法处理队列
-            for result in queue_manager.process_queue():
-                queue_data, message, logs, progress, status_text = result
-                # 实时更新UI
-                yield queue_data, status_text if status_text else "处理中..."
-            
-            # 处理完成
-            queue_items = queue_manager.get_queue()
-            queue_data = QueueManagerUI.get_queue_status()
-            status_message = f"队列处理完成，共处理了 {len(queue_items)} 个文件"
-            utils.timestamp_print(f"[队列状态] {status_message}")
-            yield queue_data, status_message
-        except Exception as e:
-            # 处理整体异常
-            error_message = f"处理队列时出错：{str(e)}"
-            utils.timestamp_print(f"[错误信息] {error_message}")
-            yield QueueManagerUI.get_queue_status(), "处理失败：" + str(e)
-
-# 语言管理
-class LanguageManager:
-    """语言管理类"""
-    @staticmethod
-    def update_language_mode(source_language):
-        """当用户选择特定语言时，自动切换语言模式为手动选择"""
-        if source_language != "auto":
-            utils.timestamp_print(f"[语言设置] 检测到手动选择语言: {source_language}，切换到手动模式")
-            return "手动选择"
-        return "自动检测"
-    
-    @staticmethod
-    def confirm_language_settings(source_language, target_language, language_mode):
-        """确认语言设置并更新显示"""
-        source_name = config.language_names.get(source_language, source_language)
-        target_name = config.language_names.get(target_language, target_language)
-        mode_display = language_mode  # 直接使用UI值，因为它已经是"自动检测"或"手动选择"
-        display_text = f"语言模式: {mode_display}\n源语言: {source_language} ({source_name})\n目标语言: {target_language} ({target_name})"
-        utils.timestamp_print(f"[语言设置] 已确认语言设置: {display_text}")
-        return display_text
-
-# 创建Gradio界面
-class VideoSubtitleUI:
-    """视频字幕工具UI类"""
-    def __init__(self):
-        # 启动系统
-        print("启动视频字幕工具...")
-        
-        self.demo = self.create_ui()
-    
-    def create_ui(self):
-        """创建Gradio界面"""
-        with gr.Blocks(title="视频转字幕工具") as demo:
-            gr.Markdown("""
-            # 视频转字幕工具
-            简洁高效的视频转字幕解决方案
-            """)
-            
-            # 主布局
-            with gr.Row():
-                # 左侧：文件管理和队列控制
-                with gr.Column(scale=2, variant="panel"):
-                    # 视频文件输入（支持多文件选择和拖拽）
-                    batch_video_input = gr.File(
-                        label="视频文件", 
-                        file_types=["video"], 
-                        type="filepath", 
-                        file_count="multiple",
-                        elem_id="video-input"
-                    )
-                    
-                    # 队列控制按钮
-                    with gr.Row(equal_height=True, elem_id="queue-controls"):
-                        add_to_queue_btn = gr.Button("添加到队列", variant="secondary")
-                        remove_from_queue_btn = gr.Button("从队列删除", variant="secondary")
-                        clear_queue_btn = gr.Button("清空队列", variant="secondary")
-                        process_queue_btn = gr.Button("开始处理", variant="primary")
-                    
-                    # 队列操作
-                    with gr.Row(elem_id="remove-index-row"):
-                        remove_index = gr.Number(
-                            label="删除索引", 
-                            value=0, 
-                            minimum=0, 
-                            precision=0, 
-                            step=1
-                        )
-                    
-                    # 队列文件列表
-                    queue_list = gr.Dataframe(
-                        label="处理队列",
-                        headers=["文件名", "状态"],
-                        datatype=["str", "str"],
-                        row_count=8,
-                        interactive=False,
-                        wrap=True,
-                        elem_classes=["queue-list"],
-                        elem_id="queue-list"
-                    )
-                    
-                    # 队列状态消息
-                    queue_status_message = gr.Textbox(
-                        label="操作状态", 
-                        interactive=False, 
-                        placeholder="操作状态将显示在这里...",
-                        lines=2,
-                        elem_id="status-message"
-                    )
-                    
-                # 右侧：参数设置
-                with gr.Column(scale=1, variant="panel"):
-                    gr.Markdown("### 参数设置")
-                    
-                    # 模型选择
-                    with gr.Tabs(elem_id="parameter-tabs"):
-                        with gr.TabItem("基本设置"):
-                            # 语音识别模型
-                            batch_model = gr.Dropdown(
-                                label="识别模型",
-                                choices=config.model_options,
-                                value=DEFAULT_CONFIG["speech_recognition_model"],
-                                info="模型越大，准确率越高，但处理速度越慢",
-                                elem_id="model-select"
-                            )
-                            
-                            # 翻译模型
-                            batch_translator = gr.Dropdown(
-                                label="翻译模型",
-                                choices=config.translator_options,
-                                value="m2m100_418M",
-                                info="m2m100_418M速度快，m2m100_1.2B准确率高",
-                                elem_id="translator-select"
-                            )
-                            
-                            # 设备选择
-                            batch_device = gr.Dropdown(
-                                label="设备",
-                                choices=["auto", "cpu", "cuda"],
-                                value=DEFAULT_CONFIG["device"],
-                                info="auto自动选择，cpu使用CPU，cuda使用GPU",
-                                elem_id="device-select"
-                            )
-                            
-                            # 语言设置
-                            with gr.Accordion("语言设置", open=True, elem_id="language-settings"):
-                                # 语言模式选择
-                                batch_language_mode = gr.Radio(
-                                    label="语言模式",
-                                    choices=["自动检测", "手动选择"],
-                                    value="自动检测" if config.default_language_mode == "auto_detect" else "手动选择",
-                                    elem_id="language-mode"
-                                )
-                                
-                                # 源语言选择
-                                batch_source_language = gr.Dropdown(
-                                    label="源语言",
-                                    choices=[lang[0] for lang in config.language_options],
-                                    value=config.default_source_language,
-                                    info="'auto'表示自动检测",
-                                    elem_id="source-language"
-                                )
-                                
-                                # 目标语言选择
-                                batch_target_language = gr.Dropdown(
-                                    label="目标语言",
-                                    choices=[lang[0] for lang in config.language_options],
-                                    value=config.default_target_language,
-                                    elem_id="target-language"
-                                )
-                        
-                        with gr.TabItem("高级设置"):
-                            # 语音识别参数
-                            with gr.Accordion("识别参数", open=False, elem_id="recognition-params"):
-                                # 语音模型批量大小设置
-                                with gr.Accordion("语音模型批量设置", open=False, elem_id="speech-batch-settings"):
-                                    # 语音模型批处理大小
-                                    batch_speech_batch_size = gr.Slider(
-                                        label="语音模型批处理大小",
-                                        value=DEFAULT_CONFIG["whisperx_params"].get("batch_size", 16),
-                                        minimum=1,
-                                        maximum=64,
-                                        step=1,
-                                        info="值越大处理速度越快但内存消耗越大",
-                                        elem_id="speech-batch-size"
-                                    )
-                                    # 批量大小预设选项
-                                    with gr.Row():
-                                        gr.Button("小 (4)", variant="secondary").click(
-                                            fn=lambda: 4,
-                                            inputs=[],
-                                            outputs=[batch_speech_batch_size]
-                                        )
-                                        gr.Button("中 (16)", variant="secondary").click(
-                                            fn=lambda: 16,
-                                            inputs=[],
-                                            outputs=[batch_speech_batch_size]
-                                        )
-                                        gr.Button("大 (32)", variant="secondary").click(
-                                            fn=lambda: 32,
-                                            inputs=[],
-                                            outputs=[batch_speech_batch_size]
-                                        )
-                                # 基础识别参数
-                                with gr.Accordion("基础识别参数", open=False, elem_id="basic-recognition-params"):
-                                    # Beam size设置
-                                    batch_beam_size = gr.Slider(
-                                        label="beam size",
-                                        value=DEFAULT_CONFIG["speech_recognition_params"]["beam_size"],
-                                        minimum=1,
-                                        maximum=10,
-                                        step=1,
-                                        info="值越大准确率越高但速度越慢",
-                                        elem_id="beam-size"
-                                    )
-                                    # VAD过滤
-                                    batch_vad_filter = gr.Checkbox(
-                                        label="VAD过滤",
-                                        value=DEFAULT_CONFIG["speech_recognition_params"]["vad_filter"],
-                                        info="过滤非语音部分",
-                                        elem_id="vad-filter"
-                                    )
-                                    # Pyannote VAD参数
-                                    with gr.Accordion("Pyannote VAD参数", open=False, elem_id="pyannote-vad-params"):
-                                        # VAD阈值
-                                        batch_vad_threshold = gr.Slider(
-                                            label="VAD阈值",
-                                            value=0.5,
-                                            minimum=0.1,
-                                            maximum=0.9,
-                                            step=0.1,
-                                            info="值越高，语音检测越严格",
-                                            elem_id="vad-threshold"
-                                        )
-                                        # 最小语音持续时间
-                                        batch_vad_min_speech = gr.Number(
-                                            label="最小语音持续时间 (ms)",
-                                            value=250,
-                                            minimum=50,
-                                            maximum=1000,
-                                            step=50,
-                                            info="低于此时间的语音将被过滤",
-                                            elem_id="vad-min-speech"
-                                        )
-                                        # 最大语音持续时间
-                                        batch_vad_max_speech = gr.Number(
-                                            label="最大语音持续时间 (s)",
-                                            value=30,
-                                            minimum=5,
-                                            maximum=60,
-                                            step=5,
-                                            info="超过此时间的语音将被分割",
-                                            elem_id="vad-max-speech"
-                                        )
-                                        # 最小沉默持续时间
-                                        batch_vad_min_silence = gr.Number(
-                                            label="最小沉默持续时间 (ms)",
-                                            value=100,
-                                            minimum=50,
-                                            maximum=500,
-                                            step=50,
-                                            info="低于此时间的沉默将被忽略",
-                                            elem_id="vad-min-silence"
-                                        )
-                                    # 单词时间戳
-                                    batch_word_timestamps = gr.Checkbox(
-                                        label="单词时间戳",
-                                        value=DEFAULT_CONFIG["speech_recognition_params"]["word_timestamps"],
-                                        info="为每个单词添加时间戳",
-                                        elem_id="word-timestamps"
-                                    )
-                                    # 基于先前文本
-                                    batch_condition_on_previous_text = gr.Checkbox(
-                                        label="基于先前文本",
-                                        value=DEFAULT_CONFIG["speech_recognition_params"]["condition_on_previous_text"],
-                                        info="利用上下文信息提高准确率",
-                                        elem_id="condition-on-previous"
-                                    )
-                            # 翻译参数
-                            with gr.Accordion("翻译参数", open=False, elem_id="translation-params"):
-                                # 翻译模型批量大小设置
-                                with gr.Accordion("翻译模型批量设置", open=False, elem_id="translation-batch-settings"):
-                                    # 翻译模型批处理大小
-                                    batch_translation_batch_size = gr.Slider(
-                                        label="翻译模型批处理大小",
-                                        value=DEFAULT_CONFIG["whisperx_params"].get("batch_size", 16),
-                                        minimum=1,
-                                        maximum=64,
-                                        step=1,
-                                        info="值越大处理速度越快但内存消耗越大",
-                                        elem_id="translation-batch-size"
-                                    )
-                                    # 批量大小预设选项
-                                    with gr.Row():
-                                        gr.Button("小 (4)", variant="secondary").click(
-                                            fn=lambda: 4,
-                                            inputs=[],
-                                            outputs=[batch_translation_batch_size]
-                                        )
-                                        gr.Button("中 (16)", variant="secondary").click(
-                                            fn=lambda: 16,
-                                            inputs=[],
-                                            outputs=[batch_translation_batch_size]
-                                        )
-                                        gr.Button("大 (32)", variant="secondary").click(
-                                            fn=lambda: 32,
-                                            inputs=[],
-                                            outputs=[batch_translation_batch_size]
-                                        )
-                                
-                                batch_translation_beam_size = gr.Slider(
-                                    label="beam size",
-                                    value=DEFAULT_CONFIG["translation_params"]["beam_size"],
-                                    minimum=1,
-                                    maximum=10,
-                                    step=1,
-                                    info="值越大翻译质量越高但速度越慢",
-                                    elem_id="translation-beam-size"
-                                )
-                                
-                                batch_translation_max_length = gr.Slider(
-                                    label="最大长度",
-                                    value=DEFAULT_CONFIG["translation_params"]["max_length"],
-                                    minimum=50,
-                                    maximum=1000,
-                                    step=50,
-                                    info="翻译结果的最大长度",
-                                    elem_id="translation-max-length"
-                                )
-                                
-
-                            # 参数控制按钮
-                            with gr.Row(equal_height=True, elem_id="parameter-controls"):
-                                save_params_btn = gr.Button("保存参数", variant="secondary")
-                                load_params_btn = gr.Button("加载参数", variant="secondary")
-                                reset_default_btn = gr.Button("恢复默认", variant="secondary")
-            
-            # 事件绑定
-            self.bind_events(
-                demo,
-                batch_video_input,
-                batch_model,
-                batch_translator,
-                batch_beam_size,
-                batch_vad_filter,
-                batch_word_timestamps,
-                batch_condition_on_previous_text,
-                batch_translation_beam_size,
-                batch_translation_max_length,
-                batch_device,
-                batch_source_language,
-                batch_target_language,
-                batch_language_mode,
-                batch_speech_batch_size,
-                batch_translation_batch_size,
-                batch_vad_threshold,
-                batch_vad_min_speech,
-                batch_vad_max_speech,
-                batch_vad_min_silence,
-                add_to_queue_btn,
-                remove_from_queue_btn,
-                clear_queue_btn,
-                process_queue_btn,
-                remove_index,
-                queue_list,
-                queue_status_message,
-                save_params_btn,
-                load_params_btn,
-                reset_default_btn
+            return (
+                msg,
+                config.get_all(),
+                default_config['model'],
+                default_config['translator'].split('/')[-1] if '/' in default_config['translator'] else default_config['translator'],
+                default_config['translator_quantization'],
+                default_config['device'],
+                default_config['source_language'],
+                default_config['target_language'],
+                default_config['vad_filter'],
+                default_config['word_timestamps'],
+                default_config['speech_batch_size'],
+                default_config['use_whisperx'],
+                default_config['whisperx_chunk_size'],
+                default_config['whisperx_vad_onset'],
+                default_config['whisperx_vad_offset'],
+                default_config['whisperx_compute_type'],
+                default_config['whisperx_condition_on_previous_text'],
+                default_config['whisperx_suppress_punctuation'],
+                default_config['whisperx_suppress_tokens'],
+                default_config['whisperx_initial_prompt'],
+                default_config['whisperx_hotwords'],
+                default_config['translation_batch_size'],
+                default_config['translation_context_size'],
+                default_config['translation_temperature'],
+                default_config['translation_top_k'],
+                default_config['translation_top_p'],
+                default_config['translation_repetition_penalty'],
+                default_config['enable_forced_alignment'],
+                default_config['max_segment_duration'],
+                default_config['sentence_pause_threshold'],
+                default_config['min_silence_for_split']
             )
         
-        return demo
+        reset_all_btn.click(
+            fn=do_reset_all,
+            outputs=[
+                status_msg, config_info,
+                model_config, translator_config, translator_quantization, device_config,
+                source_language_config, target_language_config,
+                vad_filter_config, word_timestamps_config, speech_batch_size_config, use_whisperx_config,
+                whisperx_chunk_size, whisperx_vad_onset, whisperx_vad_offset, whisperx_compute_type,
+                whisperx_condition_on_previous_text, whisperx_suppress_punctuation, whisperx_suppress_tokens,
+                whisperx_initial_prompt, whisperx_hotwords,
+                translation_batch_size, translation_context_size, translation_temperature,
+                translation_top_k, translation_top_p, translation_repetition_penalty,
+                enable_forced_alignment_config, max_segment_duration, sentence_pause_threshold, min_silence_for_split
+            ]
+        )
+        
+        video_input.change(fn=lambda: "", outputs=[status_msg])
     
-    def bind_events(self, demo, batch_video_input, batch_model, batch_translator, batch_beam_size, 
-                   batch_vad_filter, batch_word_timestamps, batch_condition_on_previous_text, 
-                   batch_translation_beam_size, batch_translation_max_length, 
-                   batch_device, batch_source_language, 
-                   batch_target_language, batch_language_mode, 
-                   batch_speech_batch_size, batch_translation_batch_size, 
-                   batch_vad_threshold, batch_vad_min_speech, batch_vad_max_speech, batch_vad_min_silence, 
-                   add_to_queue_btn, remove_from_queue_btn, clear_queue_btn, process_queue_btn, remove_index, 
-                   queue_list, queue_status_message, save_params_btn, 
-                   load_params_btn, reset_default_btn):
-        """绑定UI事件"""
-        # 源语言选择事件 - 自动更新语言模式
-        batch_source_language.change(
-            fn=LanguageManager.update_language_mode,
-            inputs=[batch_source_language],
-            outputs=[batch_language_mode]
-        )
-        
-        # 队列操作事件
-        add_to_queue_btn.click(
-            fn=QueueManagerUI.add_to_queue,
-            inputs=[
-                batch_video_input,
-                batch_model,
-                batch_translator,
-                batch_beam_size,
-                batch_vad_filter,
-                batch_word_timestamps,
-                batch_condition_on_previous_text,
-                batch_translation_beam_size,
-                batch_translation_max_length,
-                batch_device,
-                batch_source_language,
-                batch_target_language,
-                batch_language_mode,
-                batch_speech_batch_size,
-                batch_translation_batch_size,
-                batch_vad_threshold,
-                batch_vad_min_speech,
-                batch_vad_max_speech,
-                batch_vad_min_silence
-            ],
-            outputs=[
-                queue_list,
-                queue_status_message
-            ]
-        )
-        
-        # 从队列删除文件
-        remove_from_queue_btn.click(
-            fn=QueueManagerUI.remove_from_queue,
-            inputs=[remove_index],
-            outputs=[
-                queue_list,
-                queue_status_message
-            ]
-        )
-        
-        # 清空队列
-        clear_queue_btn.click(
-            fn=QueueManagerUI.clear_queue,
-            inputs=[],
-            outputs=[
-                queue_list,
-                queue_status_message
-            ]
-        )
-        
-        # 开始处理队列
-        process_queue_btn.click(
-            fn=QueueManagerUI.process_queue,
-            inputs=[],
-            outputs=[
-                queue_list,
-                queue_status_message
-            ]
-        )
-        
-        # 参数控制事件
-        save_params_btn.click(
-            fn=ParameterManager.save_params,
-            inputs=[
-                batch_model,
-                batch_translator,
-                batch_beam_size,
-                batch_vad_filter,
-                batch_word_timestamps,
-                batch_condition_on_previous_text,
-                batch_translation_beam_size,
-                batch_translation_max_length,
-                batch_device,
-                batch_source_language,
-                batch_target_language,
-                batch_language_mode,
-                batch_speech_batch_size,
-                batch_translation_batch_size,
-                batch_vad_threshold,
-                batch_vad_min_speech,
-                batch_vad_max_speech,
-                batch_vad_min_silence
-            ],
-            outputs=[queue_status_message]
-        )
-        
-        load_params_btn.click(
-            fn=ParameterManager.load_params,
-            inputs=[],
-            outputs=[
-                batch_model,
-                batch_translator,
-                batch_beam_size,
-                batch_vad_filter,
-                batch_word_timestamps,
-                batch_condition_on_previous_text,
-                batch_translation_beam_size,
-                batch_translation_max_length,
-                batch_device,
-                batch_source_language,
-                batch_target_language,
-                batch_language_mode,
-                batch_speech_batch_size,
-                batch_translation_batch_size,
-                batch_vad_threshold,
-                batch_vad_min_speech,
-                batch_vad_max_speech,
-                batch_vad_min_silence
-            ]
-        )
-        
-        reset_default_btn.click(
-            fn=ParameterManager.reset_to_default,
-            inputs=[],
-            outputs=[
-                batch_model,
-                batch_translator,
-                batch_beam_size,
-                batch_vad_filter,
-                batch_word_timestamps,
-                batch_condition_on_previous_text,
-                batch_translation_beam_size,
-                batch_translation_max_length,
-                batch_device,
-                batch_source_language,
-                batch_target_language,
-                batch_language_mode,
-                batch_speech_batch_size,
-                batch_translation_batch_size,
-                batch_vad_threshold,
-                batch_vad_min_speech,
-                batch_vad_max_speech,
-                batch_vad_min_silence
-            ]
-        )
-        
-        # 视频文件输入变化时自动清空状态消息
-        batch_video_input.change(
-            fn=lambda x: "",
-            inputs=[batch_video_input],
-            outputs=[queue_status_message]
-        )
-        
-        # 语言模式变化时的处理
-        batch_language_mode.change(
-            fn=lambda mode: "auto" if mode == "自动检测" else batch_source_language.value,
-            inputs=[batch_language_mode],
-            outputs=[batch_source_language]
-        )
-    
-    def launch(self):
-        """启动Gradio界面"""
-        utils.timestamp_print("启动视频转字幕工具界面...")
-        utils.timestamp_print("请在浏览器中打开以下URL:")
-        utils.timestamp_print("http://localhost:7870")
-        utils.timestamp_print("\n所有调试信息、错误信息都会打印到终端")
-        utils.timestamp_print("="*80)
-        
-        # 启用队列机制，支持实时更新
-        self.demo.queue(
-            max_size=50,  # 队列最大长度
-            api_open=False  # 关闭API访问
-        )
-        
-        # 启动界面
-        try:
-            self.demo.launch(
-                share=False,
-                server_name="0.0.0.0",
-                server_port=7870,
-                theme=gr.themes.Soft()
-            )
-        except OSError as e:
-            if "address already in use" in str(e).lower() or "10048" in str(e):
-                utils.timestamp_print("[警告] 端口7870已被占用，尝试使用其他端口...")
-                # 尝试使用不同端口
-                for port in range(7871, 7880):
-                    try:
-                        self.demo.launch(
-                            share=False,
-                            server_name="0.0.0.0",
-                            server_port=port,
-                            theme=gr.themes.Soft()
-                        )
-                        break
-                    except OSError:
-                        continue
-                else:
-                    utils.timestamp_print("[错误] 无法找到可用端口，启动失败")
-            else:
-                raise
+    return demo
 
 
-# 启动Gradio界面
-if __name__ == "__main__":
-    import argparse
-    
-    # 尝试加载保存的参数
-    saved_params = ParameterManager.load_params()
-    
-    # 解析命令行参数，使用保存的参数作为默认值
-    parser = argparse.ArgumentParser(description="视频转字幕工具 - 支持命令行参数")
-    parser.add_argument("--model", type=str, default=saved_params[0] if saved_params else DEFAULT_CONFIG["speech_recognition_model"], 
-                        help="语音识别模型 (tiny, base, small, medium, large-v2, large-v3)")
-    parser.add_argument("--translator", type=str, default=saved_params[1] if saved_params else "m2m100_418M", 
-                        help="翻译模型 (m2m100_418M, m2m100_1.2B)")
-    parser.add_argument("--device", type=str, default=saved_params[8] if saved_params else DEFAULT_CONFIG["device"], 
-                        help="设备选择 (auto, cpu, cuda)")
-    parser.add_argument("--source-language", type=str, default=saved_params[9] if saved_params else config.default_source_language, 
-                        help="源语言 (auto, zh, en, ja, ko, fr, de, es, ru, ar, hi, pt, it, nl, pl)")
-    parser.add_argument("--target-language", type=str, default=saved_params[10] if saved_params else config.default_target_language, 
-                        help="目标语言 (zh, en, ja, ko, fr, de, es, ru, ar, hi, pt, it, nl, pl)")
-    parser.add_argument("--language-mode", type=str, default="auto_detect" if (not saved_params or saved_params[11] == "自动检测") else "manual", 
-                        help="语言模式 (auto_detect, manual)")
-    parser.add_argument("--speech-batch-size", type=int, default=saved_params[12] if saved_params else DEFAULT_CONFIG["whisperx_params"].get("batch_size", 16), 
-                        help="语音模型批处理大小 (1-32)")
-    parser.add_argument("--translation-batch-size", type=int, default=saved_params[13] if saved_params else DEFAULT_CONFIG["whisperx_params"].get("batch_size", 16), 
-                        help="翻译模型批处理大小 (1-32)")
-    parser.add_argument("--video-files", type=str, nargs="*", 
-                        help="要处理的视频文件路径")
-    parser.add_argument("--process", action="store_true", 
-                        help="自动开始处理队列")
-    
-    args = parser.parse_args()
-    
-    # 打印命令行参数
-    utils.timestamp_print("命令行参数:")
-    utils.timestamp_print(f"  模型: {args.model}")
-    utils.timestamp_print(f"  翻译模型: {args.translator}")
-    utils.timestamp_print(f"  设备: {args.device}")
-    utils.timestamp_print(f"  源语言: {args.source_language}")
-    utils.timestamp_print(f"  目标语言: {args.target_language}")
-    utils.timestamp_print(f"  语言模式: {args.language_mode}")
-    utils.timestamp_print(f"  语音模型批处理大小: {args.speech_batch_size}")
-    utils.timestamp_print(f"  翻译模型批处理大小: {args.translation_batch_size}")
-    utils.timestamp_print(f"  视频文件: {args.video_files}")
-    utils.timestamp_print(f"  自动处理: {args.process}")
-    
-    # 启动UI
-    ui = VideoSubtitleUI()
-    
-    # 如果提供了视频文件，添加到队列
-    if args.video_files:
-        # 构建参数字典
-        translator_model = config.translator_models.get(args.translator, args.translator)
-        params = {
-            'model': args.model,
-            'translator': translator_model,
-            'beam_size': DEFAULT_CONFIG["speech_recognition_params"]["beam_size"],
-            'vad_filter': DEFAULT_CONFIG["speech_recognition_params"]["vad_filter"],
-            'word_timestamps': DEFAULT_CONFIG["speech_recognition_params"]["word_timestamps"],
-            'condition_on_previous_text': DEFAULT_CONFIG["speech_recognition_params"]["condition_on_previous_text"],
-            'translation_beam_size': DEFAULT_CONFIG["translation_params"]["beam_size"],
-            'translation_max_length': DEFAULT_CONFIG["translation_params"]["max_length"],
-            'device': args.device,
-            'source_language': args.source_language,
-            'target_language': args.target_language,
-            'language_mode': args.language_mode,
-            'use_whisperx': True,  # 默认启用WhisperX
-            'speech_batch_size': args.speech_batch_size,
-            'translation_batch_size': args.translation_batch_size
+def main():
+    """主函数"""
+    demo = create_ui()
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=7860,
+        share=False,
+        show_error=True,
+        css="""
+        .container { max-width: 1200px; margin: auto; }
+        .accordion { margin: 10px 0; }
+        .slider { margin: 5px 0; }
+        .dropdown { margin: 5px 0; }
+        .checkbox { margin: 5px 0; }
+        .textbox { margin: 5px 0; }
+        
+        /* 蓝色按钮样式 */
+        .primary-btn, button.primary, .submit-btn, button[type="submit"] {
+            background-color: #3b82f6 !important;
+            border-color: #3b82f6 !important;
+            color: white !important;
+        }
+        .primary-btn:hover, button.primary:hover, .submit-btn:hover, button[type="submit"]:hover {
+            background-color: #2563eb !important;
+            border-color: #2563eb !important;
         }
         
-        # 添加文件到队列
-        added_count = queue_manager.add_to_queue(args.video_files, params)
-        utils.timestamp_print(f"成功添加 {added_count} 个视频到队列")
-        
-        # 如果指定了自动处理，开始处理队列
-        if args.process:
-            utils.timestamp_print("开始处理队列...")
-            for result in queue_manager.process_queue():
-                queue_data, message, logs, progress, status_text = result
-                utils.timestamp_print(f"处理状态: {status_text}")
-                utils.timestamp_print(f"进度: {progress}%")
-            utils.timestamp_print("队列处理完成！")
-    
-    # 启动Gradio界面
-    ui.launch()
+        /* Gradio 按钮样式覆盖 */
+        .gr-button-primary {
+            background-color: #3b82f6 !important;
+            border-color: #3b82f6 !important;
+        }
+        .gr-button-primary:hover {
+            background-color: #2563eb !important;
+            border-color: #2563eb !important;
+        }
+        """
+    )
+
+
+if __name__ == "__main__":
+    main()

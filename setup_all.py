@@ -1,5 +1,12 @@
+# -*- coding: utf-8 -*-
 import os
 import sys
+
+# 强制使用 UTF-8 编码
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+os.environ['LC_ALL'] = 'en_US.UTF-8'
+os.environ['LANG'] = 'en_US.UTF-8'
+
 import subprocess
 
 print("=" * 80)
@@ -13,32 +20,27 @@ print("-" * 80)
 
 try:
     sys.path.insert(0, os.getcwd())
-    from download_all_models import check_aria2_installed, find_aria2_path, download_and_install_aria2
+    from aria2_downloader import Aria2Downloader
     
-    aria2_ok = check_aria2_installed()
-    aria2_path = find_aria2_path()
+    # 创建下载器实例
+    downloader = Aria2Downloader()
     
-    if aria2_ok and aria2_path:
-        print(f"[OK] aria2 found at: {aria2_path}")
-        
-        # Test aria2
-        try:
-            if aria2_path == "aria2c":
-                result = subprocess.run(["aria2c", "--version"], capture_output=True, text=True)
-            else:
-                result = subprocess.run([aria2_path, "--version"], capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                print(f"[OK] aria2 version: {result.stdout.splitlines()[0]}")
-        except Exception as e:
-            print(f"[WARN] {e}")
+    # 检查aria2是否可用
+    is_available, msg = downloader.check_aria2()
+    
+    if is_available:
+        print(f"[OK] aria2 is available: {msg}")
     else:
-        print("[INFO] aria2 not found, downloading...")
-        success = download_and_install_aria2()
+        print(f"[INFO] aria2 not found: {msg}")
+        print("[INFO] Downloading aria2...")
+        
+        # 下载aria2
+        success, download_msg = downloader.download_aria2()
         if success:
-            print("[OK] aria2 installed successfully")
+            print(f"[OK] aria2 downloaded successfully: {download_msg}")
         else:
-            print("[WARN] aria2 installation failed")
+            print(f"[WARN] aria2 download failed: {download_msg}")
+            print("[INFO] aria2 is required for faster downloads")
 except Exception as e:
     print(f"[ERROR] Failed to setup aria2: {e}")
 
@@ -78,8 +80,33 @@ else:
 
 print()
 
-# Step 3: Verify models
-print("Step 3: Checking models...")
+# Step 3: Setup llama.cpp
+print("Step 3: Setting up llama.cpp...")
+print("-" * 80)
+
+llama_cpp_dir = os.path.join(os.getcwd(), "llama_cpp")
+llama_cli_exe = os.path.join(llama_cpp_dir, "llama-cli.exe")
+
+if os.path.exists(llama_cli_exe):
+    print(f"[OK] llama.cpp found at: {llama_cli_exe}")
+else:
+    print("[INFO] llama.cpp not found, downloading...")
+    
+    # Run the Python download script
+    download_llama_cpp_script = os.path.join(os.getcwd(), "download_llama_cpp.py")
+    if os.path.exists(download_llama_cpp_script):
+        print("Running llama.cpp download script...")
+        try:
+            subprocess.run([sys.executable, download_llama_cpp_script], check=True)
+        except Exception as e:
+            print(f"[WARN] llama.cpp download failed: {e}")
+    else:
+        print("[WARN] download_llama_cpp.py not found")
+
+print()
+
+# Step 4: Verify models
+print("Step 4: Checking models...")
 print("-" * 80)
 
 models_dir = os.path.join(os.getcwd(), "models")
@@ -101,7 +128,7 @@ else:
 
 print()
 
-# Step 4: Summary
+# Step 5: Summary
 print("=" * 80)
 print("SETUP COMPLETE")
 print("=" * 80)

@@ -1,5 +1,12 @@
-import subprocess
+# -*- coding: utf-8 -*-
 import os
+
+# 强制使用 UTF-8 编码
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+os.environ['LC_ALL'] = 'en_US.UTF-8'
+os.environ['LANG'] = 'en_US.UTF-8'
+
+import subprocess
 import glob
 from config import TEMP_DIR
 

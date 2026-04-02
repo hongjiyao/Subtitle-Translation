@@ -1,1276 +1,288 @@
 #!/usr/bin/env python3
-"""
-队列管理器模块
-负责管理视频处理队列，处理队列中的视频文件
-"""
+# -*- coding: utf-8 -*-
+"""队列管理器模块"""
 import os
-import sys
+import time
+import datetime
+import gc
 
-# 确保在导入任何库之前设置HF-Mirror作为下载源
-# 这些环境变量需要在导入其他库之前设置
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["HUGGINGFACE_ENDPOINT"] = "https://hf-mirror.com"
 os.environ["TRANSFORMERS_OFFLINE"] = "0"
 os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
 os.environ["HF_HOME"] = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
 
-# 启用TF32以提高性能并避免pyannote.audio的ReproducibilityWarning
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-import time
-import subprocess
-from config import DEFAULT_CONFIG, TEMP_DIR, OUTPUT_DIR
+from config import MODEL_OPTIONS, TEMP_DIR, OUTPUT_DIR, config
 from utils.video_processor import extract_audio
-from utils.speech_recognizer import recognize_speech, clear_model_cache
+from utils.speech_recognizer import recognize_speech, recognize_speech_enhanced, clear_model_cache
 from utils.translator import translate_text, clear_translator_cache
 from utils.subtitle_generator import generate_subtitle
 
+VIDEO_EXTENSIONS = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.mpg', '.mpeg']
+MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024
 
-
-# 翻译模型映射
-translator_models = {
-    "m2m100_418M": "facebook/m2m100_418M",
-    "m2m100_1.2B": "facebook/m2m100_1.2B"
-}
-
-# 模型选项
-model_options = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
-translator_options = list(translator_models.keys())
+def log(msg):
+    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 class QueueManager:
-    """队列管理器类"""
     def __init__(self):
         self.video_queue = []
-        self.queue_processing = False
-        self.current_queue_index = -1
-        self.max_queue_length = 50  # 队列最大长度限制
+        self.processing = False
         self.logs = []
-        self.progress = 0
     
-    def log_message(self, message):
-        """添加日志消息"""
-        try:
-            if message and isinstance(message, str):
-                self.logs.append(message)
-                
-                # 添加时间戳并打印日志到终端
-                import datetime
-                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{timestamp}] [处理日志] {message}")
-                
-                # 限制日志数量，避免内存占用过大
-                if len(self.logs) > 500:
-                    self.logs = self.logs[-500:]
-            return "\n".join(self.logs)
-        except Exception as e:
-            # 忽略日志处理时的错误
-            import datetime
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{timestamp}] [错误信息] 日志处理出错: {str(e)}")
-            return ""
-    
-    def update_progress(self, value):
-        """更新进度"""
-        try:
-            if isinstance(value, (int, float)):
-                # 确保进度值在0-100之间
-                self.progress = max(0, min(100, value))
-            return self.progress
-        except Exception as e:
-            # 忽略进度更新时的错误
-            print(f"[错误信息] 进度更新出错: {str(e)}")
-            return 0
+    def add_log(self, msg):
+        if msg and isinstance(msg, str):
+            self.logs.append(msg)
+            log(f"[处理] {msg}")
+            if len(self.logs) > 500:
+                self.logs = self.logs[-500:]
+        return "\n".join(self.logs)
     
     def get_queue(self):
-        """获取队列状态
-        
-        Returns:
-            list: 队列中的所有项
-        """
         return self.video_queue
     
-    def ensure_process_termination(self, process):
-        """确保进程能够正确终止"""
-        if not process or process.poll() is not None:
-            return
-        
-        try:
-            print(f"[进程管理] 正在终止进程 PID: {process.pid}")
-        except:
-            pass
-        
-        try:
-            # 尝试优雅终止
-            process.terminate()
-            
-            # 快速等待进程终止
-            for i in range(5):  # 最多等待5秒
-                if process.poll() is not None:
-                    try:
-                        print(f"[进程管理] 进程 PID: {process.pid} 已终止，返回码: {process.returncode}")
-                    except:
-                        pass
-                    return
-                if i == 0:
-                    try:
-                        print(f"[进程管理] 等待进程 PID: {process.pid} 终止...")
-                    except:
-                        pass
-            
-            # 如果进程仍在运行，尝试强制终止
-            if process.poll() is None:
-                try:
-                    print(f"[进程管理] 强制终止进程 PID: {process.pid}")
-                except:
-                    pass
-                process.kill()
-                # 再次等待进程终止
-                for i in range(3):
-                    if process.poll() is not None:
-                        try:
-                            print(f"[进程管理] 进程 PID: {process.pid} 已强制终止，返回码: {process.returncode}")
-                        except:
-                            pass
-                        return
-            
-            # 最终检查
-            if process.poll() is None:
-                try:
-                    print(f"[进程管理] 警告: 进程 PID: {process.pid} 可能仍在运行")
-                    # 再次尝试强制终止
-                    process.kill()
-                    if process.poll() is None:
-                        print(f"[进程管理] 严重警告: 进程 PID: {process.pid} 无法终止")
-                    else:
-                        print(f"[进程管理] 进程 PID: {process.pid} 最终已终止")
-                except Exception as e:
-                    print(f"[进程管理] 最终终止尝试失败: {str(e)}")
-        except Exception as e:
-            try:
-                print(f"[进程管理] 终止进程时出错：{str(e)}")
-                # 尝试备选终止方法
-                if process.poll() is None:
-                    try:
-                        process.kill()
-                        print(f"[进程管理] 已尝试备选终止方法")
-                    except:
-                        pass
-            except:
-                pass
+    def _validate_file(self, path):
+        if not path or not isinstance(path, str):
+            return False, "无效路径"
+        if not os.path.exists(path):
+            return False, f"文件不存在: {path}"
+        if os.path.splitext(path)[1].lower() not in VIDEO_EXTENSIONS:
+            return False, "不支持的格式"
+        if os.path.getsize(path) > MAX_FILE_SIZE:
+            return False, "文件过大"
+        return True, None
     
-    def update_progress_based_on_output(self, line, current_progress):
-        """基于输出更新进度"""
-        # 更详细的阶段进度定义
-        stage_progress = {
-            '开始处理': 5,
-            '提取音频': 25,
-            '音频提取完成': 30,
-            '语音识别': 50,
-            '语音识别完成': 55,
-            '翻译日文': 75,
-            '翻译完成': 80,
-            '生成字幕': 90,
-            '字幕生成完成': 95
-        }  # 各阶段的目标进度
-        
-        stage_updated = False
-        if not line:
-            return current_progress, stage_updated
-        
-        # 标准化行内容，处理可能的编码问题
-        normalized_line = line.strip().lower()
-        
-        # 快速匹配阶段关键词
-        stage_keywords = {
-            '开始处理': ['开始', 'starting'],
-            '提取音频': ['提取音频', 'extract', 'audio'],
-            '音频提取完成': ['音频提取完成', 'audio extracted'],
-            '语音识别': ['语音识别', 'recogniz', 'transcrib'],
-            '语音识别完成': ['识别完成', 'transcript completed'],
-            '翻译日文': ['翻译', 'translate', '日文', 'japanese'],
-            '翻译完成': ['翻译完成', 'translation completed'],
-            '生成字幕': ['生成字幕', 'subtitle', 'srt'],
-            '字幕生成完成': ['字幕完成', 'subtitle completed']
-        }
-        
-        # 快速查找匹配的阶段
-        for stage, target_progress in stage_progress.items():
-            keywords = stage_keywords.get(stage, [stage.lower()])
-            if any(keyword in normalized_line for keyword in keywords):
-                if target_progress > current_progress:
-                    # 直接设置目标进度，避免循环更新
-                    self.update_progress(target_progress)
-                    stage_updated = True
-                break
-        
-        return current_progress, stage_updated
-    
-    def add_to_queue(self, video_files, params):
-        """添加文件到队列
-        
-        Args:
-            video_files: 视频文件路径列表或单个文件路径
-            params: 处理参数字典，包含以下键：
-                - model: 语音识别模型
-                - translator: 翻译模型
-                - beam_size: 语音识别beam size
-                - vad_filter: 是否启用VAD过滤
-                - word_timestamps: 是否启用单词时间戳
-                - condition_on_previous_text: 是否基于先前文本
-                - translation_beam_size: 翻译beam size
-                - translation_max_length: 翻译最大长度
-                - translation_early_stopping: 是否启用翻译早停
-                - device: 设备选择
-        
-        Returns:
-            int: 添加成功的文件数量
-        """
-        # 打印所有信息到终端
-        print("\n" + "="*80)
-        print("[队列信息] 用户执行了'添加到队列'操作")
-        print("[队列信息] 选择的视频文件:")
-        if isinstance(video_files, list):
-            for i, file in enumerate(video_files):
-                print(f"  {i+1}. {file}")
-        else:
-            print(f"  {video_files}")
-        print(f"[队列信息] 使用的模型: {params.get('model', '未知')}")
-        print(f"[队列信息] 使用的翻译模型: {params.get('translator', '未知')}")
-        print(f"[队列信息] 使用的设备: {params.get('device', '未知')}")
-        print(f"[队列信息] Beam size: {params.get('beam_size', '未知')}")
-        print(f"[队列信息] VAD filter: {params.get('vad_filter', '未知')}")
-        print(f"[队列信息] Word timestamps: {params.get('word_timestamps', '未知')}")
-        print(f"[队列信息] Condition on previous text: {params.get('condition_on_previous_text', '未知')}")
-        print(f"[队列信息] Translation beam size: {params.get('translation_beam_size', '未知')}")
-        print(f"[队列信息] Translation max length: {params.get('translation_max_length', '未知')}")
-        print(f"[队列信息] Translation early stopping: {params.get('translation_early_stopping', '未知')}")
-        print("="*80)
-        
-        try:
-            if not video_files:
-                error_msg = "未选择视频文件"
-                print(f"[错误信息] {error_msg}")
-                return 0
-            
-            # 确保video_files是列表
-            if isinstance(video_files, str):
-                video_files = [video_files]
-            elif not isinstance(video_files, list):
-                return 0
-            
-            # 处理文件路径
-            processed_files = []
-            for file_item in video_files:
-                if isinstance(file_item, str):
-                    # 直接是文件路径字符串
-                    processed_files.append(file_item)
-                elif hasattr(file_item, 'name'):
-                    # 文件对象，使用name属性获取路径
-                    processed_files.append(file_item.name)
-                elif isinstance(file_item, dict) and 'path' in file_item:
-                    # 包含path键的字典
-                    processed_files.append(file_item['path'])
-                elif isinstance(file_item, dict) and 'name' in file_item:
-                    # 包含name键的字典
-                    processed_files.append(file_item['name'])
-            
-            # 使用处理后的文件列表
-            video_files = processed_files
-            
-            # 再次检查是否有有效文件
-            if not video_files:
-                return 0
-            
-            # 检查队列长度限制
-            if len(self.video_queue) >= self.max_queue_length:
-                return 0
-            
-            # 计算剩余可添加的文件数量
-            remaining_slots = self.max_queue_length - len(self.video_queue)
-            if len(video_files) > remaining_slots:
-                video_files = video_files[:remaining_slots]  # 只取剩余可添加的数量
-                print(f"[警告信息] 队列空间不足，只添加前 {remaining_slots} 个文件")
-            
-            added_count = 0
-            for video_file in video_files:
-                try:
-                    # 检查文件是否存在
-                    if not video_file or not isinstance(video_file, str):
-                        continue
-                    
-                    if not os.path.exists(video_file):
-                        print(f"[警告信息] 文件不存在: {video_file}")
-                        continue
-                    
-                    # 检查文件是否是普通文件
-                    if not os.path.isfile(video_file):
-                        print(f"[警告信息] 不是普通文件: {video_file}")
-                        continue
-                    
-                    # 检查文件扩展名
-                    video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.mpg', '.mpeg']
-                    ext = os.path.splitext(video_file)[1].lower()
-                    if ext not in video_extensions:
-                        print(f"[警告信息] 不支持的文件格式: {ext}")
-                        continue
-                    
-                    # 检查文件大小
-                    try:
-                        file_size = os.path.getsize(video_file)
-                        # 限制文件大小为10GB
-                        if file_size > 10 * 1024 * 1024 * 1024:
-                            print(f"[警告信息] 文件过大: {video_file}")
-                            continue
-                    except Exception as e:
-                        # 忽略文件大小检查错误
-                        print(f"[警告信息] 检查文件大小时出错: {str(e)}")
-                        pass
-                    
-                    # 添加到队列
-                    queue_item = {
-                        'file_path': video_file,
-                        'filename': os.path.basename(video_file),
-                        'status': '等待中',
-                        'params': params
-                    }
-                    self.video_queue.append(queue_item)
-                    added_count += 1
-                    print(f"[成功信息] 添加文件到队列: {video_file}")
-                except Exception as e:
-                    # 处理单个文件添加时的异常
-                    print(f"[错误信息] 添加文件到队列时出错: {str(e)}")
-                    continue
-            
-            # 只打印到终端，不显示在UI中
-            print(f"[队列状态] 已添加 {added_count} 个文件到队列")
-            
-            return added_count
-        except Exception as e:
-            # 处理整体异常，只打印到终端，不显示在UI中
-            error_msg = f"添加文件到队列时出错: {str(e)}"
-            print(f"[错误信息] {error_msg}")
+    def add_to_queue(self, files, params):
+        log(f"\n{'='*80}\n[队列] 添加文件")
+        if not files:
             return 0
+        
+        files = [files] if isinstance(files, str) else files
+        processed = []
+        for f in files:
+            if isinstance(f, str):
+                processed.append(f)
+            elif hasattr(f, 'name'):
+                processed.append(f.name)
+            elif isinstance(f, dict):
+                processed.append(f.get('path') or f.get('name', ''))
+        files = [f for f in processed if f][:50 - len(self.video_queue)]
+        
+        count = 0
+        for f in files:
+            valid, err = self._validate_file(f)
+            if not valid:
+                log(f"[警告] {err}")
+                continue
+            self.video_queue.append({'file_path': f, 'filename': os.path.basename(f), 'status': '等待中', 'params': params})
+            count += 1
+            log(f"[成功] 添加: {f}")
+        
+        log(f"[队列] 已添加 {count} 个文件")
+        return count
     
-    def remove_from_queue(self, index):
-        """从队列删除文件
-        
-        Args:
-            index: 要删除的队列项索引
-        
-        Returns:
-            None
-        """
-        # 打印所有信息到终端
-        print("\n" + "="*80)
-        print("[队列信息] 用户执行了'从队列删除'操作")
-        print(f"[队列信息] 删除索引: {index}")
-        print(f"[队列信息] 当前队列长度: {len(self.video_queue)}")
-        if self.video_queue:
-            print("[队列信息] 当前队列内容:")
-            for i, item in enumerate(self.video_queue):
-                try:
-                    filename = item.get('filename', '未知文件名')
-                    status = item.get('status', '未知状态')
-                    print(f"  {i}. {filename} - {status}")
-                except:
-                    print(f"  {i}. {item}")
-        print("="*80)
-        
+    def remove_from_queue(self, idx):
+        log(f"\n{'='*80}\n[队列] 删除索引: {idx}")
+        if not self.video_queue:
+            return
         try:
-            if not self.video_queue:
-                error_msg = "队列为空，无法删除文件"
-                print(f"[错误信息] {error_msg}")
-                return
-            
-            try:
-                # 处理不同类型的索引输入
-                if isinstance(index, str):
-                    index = index.strip()
-                    if not index.isdigit():
-                        print(f"[错误信息] 请输入有效的数字索引")
-                        return
-                    index = int(index)
-                elif not isinstance(index, (int, float)):
-                    print(f"[错误信息] 索引必须是数字")
-                    return
-                else:
-                    index = int(index)
-                
-                if 0 <= index < len(self.video_queue):
-                    # 记录被删除的文件名
-                    removed_file = self.video_queue[index]['filename']
-                    self.video_queue.pop(index)
-                    print(f"[成功信息] 已从队列删除文件: {removed_file}")
-                else:
-                    error_msg = f"索引超出范围，队列长度为 {len(self.video_queue)}"
-                    print(f"[错误信息] {error_msg}")
-            except ValueError as e:
-                print(f"[错误信息] 请输入有效的索引: {str(e)}")
-            except Exception as e:
-                print(f"[错误信息] 删除文件时出错: {str(e)}")
+            idx = int(idx.strip() if isinstance(idx, str) else idx)
+            if 0 <= idx < len(self.video_queue):
+                log(f"[成功] 删除: {self.video_queue[idx]['filename']}")
+                self.video_queue.pop(idx)
         except Exception as e:
-            # 处理整体异常，只打印到终端，不显示在UI中
-            error_msg = f"从队列删除文件时出错: {str(e)}"
-            print(f"[错误信息] {error_msg}")
+            log(f"[错误] 删除失败: {e}")
     
     def clear_queue(self):
-        """清空队列
-        
-        Returns:
-            int: 清除的文件数量
-        """
-        # 打印所有信息到终端
-        print("\n" + "="*80)
-        print("[队列信息] 用户执行了'清空队列'操作")
-        print(f"[队列信息] 清空前队列长度: {len(self.video_queue)}")
-        if self.video_queue:
-            print("[队列信息] 清空前队列内容:")
-            for i, item in enumerate(self.video_queue):
-                try:
-                    filename = item.get('filename', '未知文件名')
-                    status = item.get('status', '未知状态')
-                    print(f"  {i}. {filename} - {status}")
-                except:
-                    print(f"  {i}. {item}")
-        print("="*80)
-        
-        try:
-            # 记录清空前的队列长度
-            cleared_count = len(self.video_queue)
-            self.video_queue = []
-            
-            if cleared_count > 0:
-                print(f"[成功信息] 队列已清空，共删除 {cleared_count} 个文件")
-            else:
-                print(f"[信息] 队列为空")
-            
-            return cleared_count
-        except Exception as e:
-            # 处理异常，只打印到终端，不显示在UI中
-            error_msg = f"清空队列时出错: {str(e)}"
-            print(f"[错误信息] {error_msg}")
-            return 0
+        log(f"\n{'='*80}\n[队列] 清空")
+        count = len(self.video_queue)
+        self.video_queue = []
+        log(f"[成功] 清空 {count} 个文件")
+        return count
     
-    def get_gpu_memory(self):
-        """使用nvidia-smi获取GPU内存使用情况
-        
-        Returns:
-            dict: 包含总内存和可用内存的字典
-        """
-        try:
-            import subprocess
-            import re
-            
-            # 执行nvidia-smi命令
-            result = subprocess.run(
-                ['nvidia-smi', '--query-gpu=memory.total,memory.free', '--format=csv,noheader,nounits'],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            
-            # 解析输出
-            output = result.stdout.strip()
-            if output:
-                total, free = map(int, output.split(','))
-                return {
-                    'total': total / 1024,  # 转换为GB
-                    'available': free / 1024,  # 转换为GB
-                    'allocated': (total - free) / 1024  # 转换为GB
-                }
-            return {'total': 0, 'available': 0, 'allocated': 0}
-        except Exception as e:
-            print(f"[错误信息] 获取GPU内存时出错: {str(e)}")
-            return {'total': 0, 'available': 0, 'allocated': 0}
-    
-    def adjust_batch_size(self, device, model_name, translator_model, use_whisperx=False):
-        """根据设备和模型自动调整批处理大小
-        
-        Args:
-            device: 设备选择
-            model_name: 语音识别模型名称
-            translator_model: 翻译模型名称
-            use_whisperx: 是否使用WhisperX
-            
-        Returns:
-            int: 调整后的批处理大小
-        """
-        if device == 'cpu':
-            return 1  # CPU模式下使用较小的批处理大小
-        
-        # 获取GPU内存情况
-        memory = self.get_gpu_memory()
-        total_memory = memory['total']
-        available_memory = memory['available']
-        
-        # 移除预留缓冲，完全使用可用内存
-        buffer_memory = 0
-        usable_memory = available_memory
-        
-        # 确定模型类型
-        is_translator = not (model_name in ['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3'])
-        model_type = "翻译模型" if is_translator else "语音模型"
-        
-        # 获取模型大小
-        if is_translator:
-            # 翻译模型大小
-            if '418M' in translator_model:
-                model_size = 1.85
-            elif '1.2B' in translator_model:
-                model_size = 4.73
-            else:
-                model_size = 1.85
-        else:
-            # 语音模型大小
-            default_sizes = {
-                'tiny': 0.07, 'base': 0.14, 'small': 0.46, 'medium': 1.46, 
-                'large': 3.09, 'large-v2': 3.09, 'large-v3': 3.09
-            }
-            model_size = default_sizes.get(model_name, 0.46)
-            
-            # WhisperX需要额外的内存
-            if use_whisperx:
-                model_size *= 1.2
-        
-        # 计算内存需求 - 进一步优化批次内存需求计算
-        # 对于批次处理，每个批次的内存需求通常远小于模型大小
-        if is_translator:
-            # 翻译模型批次内存需求
-            batch_memory_per_item = model_size * 0.5  # 进一步降低翻译模型批次内存需求
-        else:
-            # 语音模型批次内存需求
-            batch_memory_per_item = model_size * 0.4  # 进一步降低语音模型批次内存需求
-        
-        # 计算可用内存用于批处理 - 直接使用全部可用内存
-        memory_for_batching = max(0, usable_memory)
-        
-        # 计算批处理大小
-        if memory_for_batching <= 0:
-            batch_size = 1
-        else:
-            # 计算理论批处理大小
-            batch_size = int(memory_for_batching / batch_memory_per_item)
-            
-            # 确保批处理大小在合理范围内
-            batch_size = max(1, min(32, batch_size))
-            
-            # 应用模型特定的最大批处理大小限制
-            if not is_translator:
-                # 语音模型的最大批处理大小
-                max_sizes = {
-                    'tiny': 32, 'base': 24, 'small': 16, 'medium': 12,
-                    'large': 6, 'large-v2': 6, 'large-v3': 6
-                }
-                batch_size = min(batch_size, max_sizes.get(model_name, 12))
-            else:
-                # 翻译模型的最大批处理大小
-                if '418M' in translator_model:
-                    batch_size = min(batch_size, 24)
-                elif '1.2B' in translator_model:
-                    batch_size = min(batch_size, 12)
-                else:
-                    batch_size = min(batch_size, 24)
-        
-        # 打印内存占用信息
-        info = [
-            f"[内存管理] GPU总内存: {total_memory:.2f}GB, 可用内存: {available_memory:.2f}GB",
-            f"[内存管理] 预留缓冲: {buffer_memory:.2f}GB, 可用内存(扣除缓冲): {usable_memory:.2f}GB",
-            f"[内存管理] {model_type}大小: {model_size:.2f}GB",
-            f"[内存管理] 批处理可用内存: {memory_for_batching:.2f}GB",
-            f"[内存管理] 每个批次内存需求: {batch_memory_per_item:.2f}GB (优化计算)",
-            f"[内存管理] 调整批处理大小为: {batch_size}"
-        ]
-        
-        for line in info:
-            print(line)
-            self.log_message(line)
-        
-        return batch_size
+    def _cleanup(self, device):
+        gc.collect()
+        if device != 'cpu':
+            torch.cuda.empty_cache()
+        gc.collect()
     
     def process_video(self, video_file, params):
-        """处理单个视频文件
-        
-        Args:
-            video_file: 视频文件路径
-            params: 处理参数字典
-        
-        Returns:
-            tuple: (成功标志, 消息, 输出路径, 日志)
-        """
-        # 定义一个内部进度回调函数，用于实时更新进度
-        def progress_callback(progress):
-            """进度回调函数"""
-            # 只更新进度，不打印日志，避免大量重复输出
-            self.update_progress(progress)
-        
         try:
-            # 验证输入
-            if not video_file:
-                error_msg = "未选择视频文件"
-                print(f"[错误信息] {error_msg}")
-                return False, "未选择视频文件", None, []
-            
-            if not os.path.exists(video_file):
-                error_msg = f"文件不存在：{video_file}"
-                print(f"[错误信息] {error_msg}")
+            if not video_file or not os.path.exists(video_file):
                 return False, "文件不存在", None, []
             
-            # 检查文件扩展名
-            video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.mpg', '.mpeg']
-            ext = os.path.splitext(video_file)[1].lower()
-            if ext not in video_extensions:
-                error_msg = f"不支持的文件格式：{ext}，请选择视频文件"
-                print(f"[错误信息] {error_msg}")
-                return False, "不支持的文件格式，请选择视频文件", None, []
+            if os.path.splitext(video_file)[1].lower() not in VIDEO_EXTENSIONS:
+                return False, "不支持的格式", None, []
             
-            # 参数验证
+            # 验证参数
+            if params['model'] not in MODEL_OPTIONS:
+                return False, "模型选择错误", None, []
+            
+            translator = params['translator']
+            if translator not in ['tencent/HY-MT1.5-7B-GGUF', 'HY-MT1.5-7B-GGUF']:
+                return False, f"翻译模型错误: {translator} 不在支持的模型列表中", None, []
+            
+            output_path = params.get('output_path') or os.path.join(OUTPUT_DIR, f"{os.path.splitext(os.path.basename(video_file))[0]}_subtitles.srt")
+            src_lang = params.get('source_language', 'auto')
+            tgt_lang = params.get('target_language', 'zh')
+            
+            self.add_log(f"开始处理: {video_file}")
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            
+            # 1. 提取音频
+            log("[阶段] 1. 提取音频")
+            self.add_log("1. 提取音频...")
+            start = time.time()
+            audio_path = extract_audio(video_file)
+            self.add_log(f"音频提取完成，耗时: {time.time() - start:.2f}s")
+            self._cleanup(params['device'])
+            
+            # 2. 语音识别（使用增强版）
+            log("[阶段] 2. 语音识别")
+            self.add_log("2. 语音识别...")
+            
+            # 检查是否启用增强功能
+            use_enhanced = params.get('enable_forced_alignment', True)
+            
+            # 使用增强版语音识别函数，支持强制对齐
+            self.add_log("使用增强版语音识别（强制对齐）...")
+            recognized = recognize_speech_enhanced(
+                audio_path, params['model'],
+                detected_language=None if src_lang == 'auto' else src_lang,
+                device_choice=params['device'],
+                progress_callback=None,
+                word_timestamps=params.get('word_timestamps', True),
+                whisperx_batch_size=params.get('speech_batch_size', 16),
+                vad_threshold=params.get('whisperx_vad_onset', 0.3),
+                enable_alignment=params.get('enable_forced_alignment', True),
+                enable_segmentation=True,
+                segmentation_options=config.get_segmentation_options()
+            )
+            
+            self.add_log(f"语音识别完成，语言: {recognized['language']}")
+            if use_enhanced:
+                seg_count = len(recognized.get('segments', []))
+                self.add_log(f"生成 {seg_count} 个对齐段落")
+            
+            # 保存原始语音识别结果到输出文件夹
             try:
-                beam_size = int(params['beam_size'])
-                translation_beam_size = int(params['translation_beam_size'])
-                translation_max_length = int(params['translation_max_length'])
-                
-                # 验证beam_size范围
-                if beam_size < 1 or beam_size > 10:
-                    return False, "语音识别beam size必须在1-10之间", None, []
-                
-                # 验证translation_beam_size范围
-                if translation_beam_size < 1 or translation_beam_size > 10:
-                    return False, "翻译beam size必须在1-10之间", None, []
-                
-                # 验证translation_max_length范围
-                if translation_max_length < 50 or translation_max_length > 1000:
-                    return False, "翻译最大长度必须在50-1000之间", None, []
-                
-                # 验证device值
-                if params['device'] not in ["auto", "cpu", "cuda"]:
-                    return False, "设备选择必须是auto、cpu或cuda", None, []
-                    
-                # 验证模型值
-                if params['model'] not in model_options:
-                    return False, "语音识别模型选择错误", None, []
-                    
-                # 验证翻译模型值
-                # 允许使用完整的模型名称或简称
-                if params['translator'] not in translator_options and params['translator'] not in translator_models.values():
-                    return False, "翻译模型选择错误", None, []
-            except ValueError as e:
-                error_msg = f"参数错误：{str(e)}"
-                print(f"[错误信息] {error_msg}")
-                return False, "参数错误，请检查输入", None, []
+                base_name = os.path.splitext(os.path.basename(video_file))[0]
+                raw_recognition_path = os.path.join(OUTPUT_DIR, f"{base_name}_raw_recognition.json")
+                import json
+                with open(raw_recognition_path, 'w', encoding='utf-8') as f:
+                    json.dump(recognized, f, ensure_ascii=False, indent=2)
+                self.add_log(f"原始语音识别结果已保存: {raw_recognition_path}")
+
+                # 同时保存原文字幕文件
+                original_subtitle_path = os.path.join(OUTPUT_DIR, f"{base_name}_original_subtitles.srt")
+                generate_subtitle(recognized, original_subtitle_path)
+                self.add_log(f"原文字幕已保存: {original_subtitle_path}")
             except Exception as e:
-                error_msg = f"参数验证出错：{str(e)}"
-                print(f"[错误信息] {error_msg}")
-                return False, "参数验证出错", None, []
+                self.add_log(f"保存原始语音识别结果失败: {str(e)}")
             
-            # 获取实际的翻译模型路径
-            try:
-                # 检查是否是完整的模型名称
-                if params['translator'] in translator_models.values():
-                    # 已经是完整的模型名称
-                    translator_model = params['translator']
-                else:
-                    # 尝试使用简称查找
-                    translator_model = translator_models.get(params['translator'], params['translator'])
-            except Exception as e:
-                error_msg = f"获取翻译模型路径时出错：{str(e)}"
-                print(f"[错误信息] {error_msg}")
-                return False, "获取翻译模型路径时出错", None, []
+            clear_model_cache()
+            self._cleanup(params['device'])
             
-            # 生成输出路径
-            try:
-                # 检查是否有用户自定义的输出路径
-                if 'output_path' in params and params['output_path']:
-                    # 使用用户自定义的输出路径
-                    output_path = params['output_path']
-                    # 确保输出目录存在
-                    output_dir = os.path.dirname(output_path)
-                    if output_dir and not os.path.exists(output_dir):
-                        os.makedirs(output_dir, exist_ok=True)
-                else:
-                    # 使用默认输出路径
-                    base_name = os.path.splitext(os.path.basename(video_file))[0]
-                    output_path = os.path.join(OUTPUT_DIR, f"{base_name}_subtitles.srt")
-            except Exception as e:
-                error_msg = f"生成输出路径时出错：{str(e)}"
-                print(f"[错误信息] {error_msg}")
-                return False, "生成输出路径时出错", None, []
-            
-            # 获取语言设置
-            source_language = params.get('source_language', 'auto')
-            target_language = params.get('target_language', 'zh')
-            
-            # 内存管理：检查初始内存状态
-            print("[内存管理] 检查初始内存状态...")
-            memory_status = self.get_gpu_memory()
-            print(f"[内存管理] 初始GPU内存: 总内存={memory_status['total']:.2f}GB, 可用内存={memory_status['available']:.2f}GB")
-            self.log_message(f"[内存管理] 初始GPU内存: 总内存={memory_status['total']:.2f}GB, 可用内存={memory_status['available']:.2f}GB")
-            
-            self.log_message(f"开始处理视频: {video_file}")
-            self.log_message(f"输出路径: {output_path}")
-            self.log_message(f"使用模型: {params['model']}")
-            self.log_message(f"使用翻译模型: {translator_model}")
-            self.log_message(f"设备选择: {params['device']}")
-            self.log_message(f"源语言: {source_language}")
-            self.log_message(f"目标语言: {target_language}")
-            
-            # 直接调用处理逻辑，不使用 subprocess
-            try:
-                # 确保临时目录存在
-                os.makedirs(TEMP_DIR, exist_ok=True)
-                
-                # 1. 提取音频
-                print("[处理阶段] 1. 提取音频...")
-                self.log_message("1. 提取音频...")
-                start_time = time.time()
-                
+            # 3. 翻译
+            translated = recognized
+            if recognized['language'] != tgt_lang:
+                log("[阶段] 3. 翻译")
+                self.add_log("3. 翻译...")
                 try:
-                    audio_path = extract_audio(video_file)
-                except Exception as e:
-                    error_msg = f"音频提取失败 - {str(e)}"
-                    print(f"[错误信息] {error_msg}")
-                    self.log_message(f"错误: {error_msg}")
-                    return False, f"音频提取失败: {str(e)}", None, self.logs
-                
-                extract_time = time.time() - start_time
-                extract_msg = f"音频提取完成，耗时: {extract_time:.2f} 秒"
-                print(f"[处理结果] {extract_msg}")
-                self.log_message(extract_msg)
-                
-                # 更新进度
-                self.update_progress(30)
-                
-                # 内存管理：音频提取后清理内存
-                print("[内存管理] 音频提取后清理内存...")
-                try:
-                    import gc
-                    gc.collect()
-                except Exception as e:
-                    print(f"[错误信息] 清理内存时出错: {str(e)}")
-                
-                # 2. 语音识别
-                print("[处理阶段] 2. 语音识别...")
-                self.log_message("\n2. 语音识别...")
-                
-                # 内存管理：语音识别前检查内存
-                memory_status = self.get_gpu_memory()
-                print(f"[内存管理] 语音识别前GPU内存: 可用内存={memory_status['available']:.2f}GB")
-                
-                # 使用用户设置的批处理大小
-                use_whisperx = params.get('use_whisperx', False)
-                speech_batch_size = params.get('speech_batch_size', DEFAULT_CONFIG["whisperx_params"].get("batch_size", 16))
-                print(f"[内存管理] 使用用户设置的语音模型批处理大小: {speech_batch_size}")
-                self.log_message(f"[内存管理] 使用用户设置的语音模型批处理大小: {speech_batch_size}")
-                
-                start_time = time.time()
-                
-                try:
-                    # 如果源语言不是auto，传递给recognize_speech
-                    detected_language = source_language if source_language != 'auto' else None
-                    # 始终使用WhisperX和Pyannote VAD
-                    recognized_text = recognize_speech(
-                            audio_path, 
-                            params['model'], 
-                            detected_language=detected_language,
-                            device_choice=params['device'],
-                            progress_callback=lambda progress: progress_callback(30 + progress * 0.25),
-                            vad_filter=params['vad_filter'],
-                            word_timestamps=False,  # WhisperX不再支持单词时间戳
-                            condition_on_previous_text=params['condition_on_previous_text'],
-                            use_whisperx=True,
-                            whisperx_batch_size=speech_batch_size,
-                            # Pyannote VAD参数
-                            vad_threshold=params.get('vad_threshold', 0.5),
-                            vad_min_speech_duration_ms=params.get('vad_min_speech_duration_ms', 250),
-                            vad_max_speech_duration_s=params.get('vad_max_speech_duration_s', 30),
-                            vad_min_silence_duration_ms=params.get('vad_min_silence_duration_ms', 100)
-                        )
-                except Exception as e:
-                    error_msg = f"语音识别失败 - {str(e)}"
-                    print(f"[错误信息] {error_msg}")
-                    self.log_message(f"错误: {error_msg}")
-                    return False, f"语音识别失败: {str(e)}", None, self.logs
-                
-                recognize_time = time.time() - start_time
-                recognize_msg = f"语音识别完成，耗时: {recognize_time:.2f} 秒"
-                language_msg = f"检测到的语言: {recognized_text['language']}"
-                print(f"[处理结果] {recognize_msg}")
-                print(f"[处理结果] {language_msg}")
-                self.log_message(recognize_msg)
-                self.log_message(language_msg)
-                
-                # 内存管理：语音识别后检查内存
-                memory_status = self.get_gpu_memory()
-                print(f"[内存管理] 语音识别后GPU内存: 可用内存={memory_status['available']:.2f}GB")
-                
-                # 更新进度
-                self.update_progress(55)
-                
-                # 卸载语音模型，释放显存
-                print("[资源管理] 卸载语音模型，释放显存...")
-                try:
-                    clear_model_cache()
-                    # 执行垃圾回收
-                    import gc
-                    gc.collect()
-                    # 清空CUDA缓存
-                    if params['device'] != 'cpu':
-                        import torch
-                        torch.cuda.empty_cache()
-                    # 再次垃圾回收
-                    gc.collect()
-                    # 快速内存清理，减少等待时间
-                    print("[资源管理] 语音模型已卸载，内存已释放")
-                    self.log_message("[资源管理] 语音模型已卸载，内存已释放")
-                    
-                    # 内存管理：卸载模型后检查内存
-                    memory_status = self.get_gpu_memory()
-                    print(f"[内存管理] 卸载语音模型后GPU内存: 可用内存={memory_status['available']:.2f}GB")
-                except Exception as e:
-                    print(f"[错误信息] 卸载语音模型时出错: {str(e)}")
-                    self.log_message(f"[错误信息] 卸载语音模型时出错: {str(e)}")
-                
-                # 3. 翻译（如果源语言不是目标语言）
-                translated_text = recognized_text
-                translate_time = 0
-                if recognized_text['language'] != target_language:
-                    print("[处理阶段] 3. 翻译...")
-                    self.log_message("\n3. 翻译...")
-                    
-                    # 重新获取当前系统的可用内存状态
-                    print("[内存管理] 重新获取系统可用内存状态...")
-                    memory_status = self.get_gpu_memory()
-                    print(f"[内存管理] 翻译前GPU内存: 可用内存={memory_status['available']:.2f}GB")
-                    
-                    # 使用用户设置的批处理大小
-                    translation_batch_size = params.get('translation_batch_size', DEFAULT_CONFIG["whisperx_params"].get("batch_size", 16))
-                    print(f"[内存管理] 使用用户设置的翻译模型批处理大小: {translation_batch_size}")
-                    self.log_message(f"[内存管理] 使用用户设置的翻译模型批处理大小: {translation_batch_size}")
-                    
-                    start_time = time.time()
-                    
-                    try:
-                        # 传递目标语言到translate_text
-                        # 使用计算的翻译模型批处理大小
-                        translated_text = translate_text(
-                            recognized_text, 
-                            translator_model, 
-                            device_choice=params['device'],
-                            progress_callback=lambda progress: progress_callback(55 + progress * 0.25),
-                            beam_size=params['translation_beam_size'],
-                            max_length=params['translation_max_length'],
-                            target_language=target_language,
-                            batch_size=translation_batch_size
-                        )
-                    except Exception as e:
-                        # 内存管理：如果是内存不足错误，尝试减小批处理大小
-                        if "out of memory" in str(e).lower():
-                            print("[内存管理] 检测到内存不足错误，尝试减小批处理大小...")
-                            self.log_message("[内存管理] 检测到内存不足错误，尝试减小批处理大小...")
-                            
-                            # 减小批处理大小并重新尝试
-                            reduced_batch_size = max(1, translation_batch_size // 2)
-                            print(f"[内存管理] 将批处理大小减小到: {reduced_batch_size}")
-                            self.log_message(f"[内存管理] 将批处理大小减小到: {reduced_batch_size}")
-                            
-                            try:
-                                translated_text = translate_text(
-                                    recognized_text, 
-                                    translator_model, 
-                                    device_choice=params['device'],
-                                    progress_callback=lambda progress: progress_callback(55 + progress * 0.25),
-                                    beam_size=params['translation_beam_size'],
-                                    max_length=params['translation_max_length'],
-                                    target_language=target_language,
-                                    batch_size=reduced_batch_size
-                                )
-                            except Exception as e2:
-                                error_msg = f"翻译失败 - {str(e2)}"
-                                print(f"[错误信息] {error_msg}")
-                                self.log_message(f"错误: {error_msg}")
-                                return False, f"翻译失败: {str(e2)}", None, self.logs
-                        else:
-                            error_msg = f"翻译失败 - {str(e)}"
-                            print(f"[错误信息] {error_msg}")
-                            self.log_message(f"错误: {error_msg}")
-                            return False, f"翻译失败: {str(e)}", None, self.logs
-                    
-                    translate_time = time.time() - start_time
-                    translate_msg = f"翻译完成，耗时: {translate_time:.2f} 秒"
-                    print(f"[处理结果] {translate_msg}")
-                    self.log_message(translate_msg)
-                    
-                    # 内存管理：翻译后检查内存
-                    memory_status = self.get_gpu_memory()
-                    print(f"[内存管理] 翻译后GPU内存: 可用内存={memory_status['available']:.2f}GB")
-                else:
-                    skip_msg = f"跳过翻译步骤，因为源语言和目标语言相同 ({target_language})"
-                    print(f"[处理结果] {skip_msg}")
-                    self.log_message(skip_msg)
-                    # 更新进度
-                    self.update_progress(80)
-                
-                # 卸载翻译模型，释放全部内存
-                print("[资源管理] 卸载翻译模型，释放全部内存...")
-                try:
-                    clear_translator_cache()
-                    # 执行垃圾回收
-                    import gc
-                    gc.collect()
-                    # 清空CUDA缓存
-                    if params['device'] != 'cpu':
-                        import torch
-                        torch.cuda.empty_cache()
-                    # 再次垃圾回收
-                    gc.collect()
-                    # 快速内存清理，减少等待时间
-                    print("[资源管理] 翻译模型已卸载，全部内存已释放")
-                    self.log_message("[资源管理] 翻译模型已卸载，全部内存已释放")
-                    
-                    # 内存管理：卸载模型后检查内存
-                    memory_status = self.get_gpu_memory()
-                    print(f"[内存管理] 卸载翻译模型后GPU内存: 可用内存={memory_status['available']:.2f}GB")
-                except Exception as e:
-                    print(f"[错误信息] 卸载翻译模型时出错: {str(e)}")
-                    self.log_message(f"[错误信息] 卸载翻译模型时出错: {str(e)}")
-                
-                # 更新进度
-                self.update_progress(80)
-                
-                # 4. 生成字幕
-                print("[处理阶段] 4. 生成字幕...")
-                self.log_message("\n4. 生成字幕...")
-                start_time = time.time()
-                
-                try:
-                    generate_subtitle(
-                        translated_text, 
-                        output_path, 
-                        progress_callback=lambda progress: progress_callback(80 + progress * 0.2)
+                    translated = translate_text(
+                        recognized, translator, device_choice=params['device'],
+                        target_language=tgt_lang,
+                        batch_size=params.get('translation_batch_size', 4096),
+                        context_size=params.get('translation_context_size', 4096)
                     )
+                    self.add_log("翻译完成")
                 except Exception as e:
-                    error_msg = f"字幕生成失败 - {str(e)}"
-                    print(f"[错误信息] {error_msg}")
-                    self.log_message(f"错误: {error_msg}")
-                    return False, f"字幕生成失败: {str(e)}", None, self.logs
-                
-                generate_time = time.time() - start_time
-                generate_msg = f"字幕生成完成，耗时: {generate_time:.2f} 秒"
-                print(f"[处理结果] {generate_msg}")
-                self.log_message(generate_msg)
-                
-                # 显示总耗时
-                total_time = extract_time + recognize_time + translate_time + generate_time
-                complete_msg = f"字幕生成完成：{output_path}"
-                total_time_msg = f"总耗时: {total_time:.2f} 秒"
-                print(f"[最终结果] {complete_msg}")
-                print(f"[最终结果] {total_time_msg}")
-                self.log_message(complete_msg)
-                self.log_message(total_time_msg)
-                
-                # 更新进度到100%
-                self.update_progress(100)
-                
-                # 清理临时文件
-                print("[资源管理] 清理临时文件...")
-                if os.path.exists(TEMP_DIR):
+                    if "out of memory" in str(e).lower():
+                        self.add_log("[内存] 不足，减小token限制重试")
+                        translated = translate_text(
+                            recognized, translator, device_choice=params['device'],
+                            target_language=tgt_lang,
+                            batch_size=params.get('translation_batch_size', 4096) // 2,
+                            context_size=params.get('translation_context_size', 4096)
+                        )
+                    else:
+                        raise
+            else:
+                self.add_log(f"跳过翻译，源语言与目标语言相同 ({tgt_lang})")
+            
+            clear_translator_cache()
+            self._cleanup(params['device'])
+            
+            # 4. 生成字幕
+            log("[阶段] 4. 生成字幕")
+            self.add_log("4. 生成字幕...")
+            generate_subtitle(translated, output_path)
+            self.add_log(f"字幕生成完成，总耗时: {time.time() - start:.2f}s")
+            
+            # 清理临时文件
+            if os.path.exists(TEMP_DIR):
+                for f in os.listdir(TEMP_DIR):
                     try:
-                        for file in os.listdir(TEMP_DIR):
-                            file_path = os.path.join(TEMP_DIR, file)
-                            try:
-                                os.remove(file_path)
-                                print(f"[资源管理] 已删除临时文件: {file}")
-                                self.log_message(f"[资源管理] 已删除临时文件: {file}")
-                            except Exception as e:
-                                # 如果文件正在使用，跳过删除
-                                print(f"[错误信息] 清理临时文件时出错: {str(e)}")
-                                self.log_message(f"[错误信息] 清理临时文件时出错: {str(e)}")
-                                continue
-                    except Exception as e:
-                        # 忽略清理错误，不影响主流程
-                        print(f"[错误信息] 清理临时文件时出错: {str(e)}")
-                        self.log_message(f"[错误信息] 清理临时文件时出错: {str(e)}")
-                        pass
-                else:
-                    print("[资源管理] 临时目录不存在，跳过清理")
-                
-                # 执行垃圾回收
-                print("[资源管理] 执行垃圾回收...")
-                try:
-                    import gc
-                    gc.collect()
-                    print("[资源管理] 已执行垃圾回收")
-                    self.log_message("[资源管理] 已执行垃圾回收")
-                    
-                    # 内存管理：最终内存状态
-                    memory_status = self.get_gpu_memory()
-                    print(f"[内存管理] 最终GPU内存: 可用内存={memory_status['available']:.2f}GB")
-                    self.log_message(f"[内存管理] 最终GPU内存: 可用内存={memory_status['available']:.2f}GB")
-                except Exception as e:
-                    print(f"[错误信息] 执行垃圾回收时出错: {str(e)}")
-                    self.log_message(f"[错误信息] 执行垃圾回收时出错: {str(e)}")
-                
-                # 检查输出文件是否存在
-                print("[结果验证] 检查输出文件是否存在...")
-                if os.path.exists(output_path):
-                    success_msg = f"字幕生成完成: {output_path}"
-                    print(f"[最终结果] {success_msg}")
-                    print("[最终结果] 处理成功！")
-                    self.log_message(success_msg)
-                    self.log_message("处理成功！")
-                    message = "处理成功！"
-                    print(f"[返回信息] 成功: {message}")
-                    return True, message, output_path, self.logs
-                else:
-                    error_msg = f"字幕文件不存在: {output_path}"
-                    print(f"[错误信息] {error_msg}")
-                    print("[最终结果] ❌ 处理失败！")
-                    self.log_message(error_msg)
-                    self.log_message("❌ 处理失败！")
-                    message = "处理失败，字幕文件未生成"
-                    print(f"[返回信息] 失败: {message}")
-                    return False, message, None, self.logs
-                    
-            except Exception as e:
-                # 处理整体异常
-                import traceback
-                error_message = f"处理视频时出错：{str(e)}"
-                error_detail = f"详细错误：{traceback.format_exc()}"
-                print(f"[错误信息] {error_message}")
-                print(f"[错误信息] {error_detail}")
-                self.log_message(f"[错误信息] {error_message}")
-                self.log_message(f"[错误信息] {error_detail}")
-                
-                # 内存管理：异常时清理内存
-                try:
-                    import gc
-                    gc.collect()
-                except Exception as e2:
-                    print(f"[错误信息] 异常时清理内存出错: {str(e2)}")
-                
-                return False, f"处理过程中出现错误: {str(e)}", None, self.logs
-        except Exception as e:
-            # 处理整体异常，只打印到终端，不显示在UI中
-            import traceback
-            error_message = f"处理视频时出错：{str(e)}"
-            error_detail = f"详细错误：{traceback.format_exc()}"
-            print(f"[错误信息] {error_message}")
-            print(f"[错误信息] {error_detail}")
-            self.log_message(f"[错误信息] {error_message}")
-            self.log_message(f"[错误信息] {error_detail}")
-            
-            # 内存管理：异常时清理内存
-            try:
-                import gc
-                gc.collect()
-            except Exception as e2:
-                print(f"[错误信息] 异常时清理内存出错: {str(e2)}")
-            
-            return False, "处理过程中出现错误", None, self.logs
-    
-    def process_queue(self):
-        """处理队列中的所有视频文件
-        
-        Yields:
-            tuple: (队列数据, 结果消息, 日志输出, 进度值, 队列状态文本)
-        """
-        # 打印所有信息到终端
-        print("\n" + "="*80)
-        print("[队列信息] 用户执行了'开始处理队列'操作")
-        print(f"[队列信息] 当前队列长度: {len(self.video_queue)}")
-        if self.video_queue:
-            print("[队列信息] 队列内容:")
-            for i, item in enumerate(self.video_queue):
-                try:
-                    filename = item.get('filename', '未知文件名')
-                    status = item.get('status', '未知状态')
-                    print(f"  {i}. {filename} - {status}")
-                except:
-                    print(f"  {i}. {item}")
-        print("="*80)
-        
-        try:
-            if not self.video_queue:
-                error_msg = "队列为空，没有文件可处理"
-                print(f"[错误信息] {error_msg}")
-                yield [], "", "", 0, ""
-                return
-            
-            if self.queue_processing:
-                yield [[item['filename'], item['status']] for item in self.video_queue], "", "", 0, ""
-                return
-            
-            self.queue_processing = True
-            self.current_queue_index = 0
-            
-            try:
-                # 动态遍历队列，使用索引跟踪当前处理位置
-                i = 0
-                while i < len(self.video_queue):
-                    # 获取当前队列项
-                    queue_item = self.video_queue[i]
-                    # 记录当前处理的文件名，用于日志和错误信息
-                    current_filename = queue_item.get('filename', '未知文件')
-                    
-                    # 更新队列状态
-                    try:
-                        self.video_queue[i]['status'] = '处理中'
-                        queue_data = [[item['filename'], item['status']] for item in self.video_queue]
-                        # 使用当前队列的实际长度来计算进度
-                        current_total = len(self.video_queue)
-                        queue_status_text = f"正在处理队列中的第 {i+1}/{current_total} 个文件：{current_filename}"
-                        # 打印到终端
-                        print(f"[队列状态] {queue_status_text}")
-                    except Exception as e:
-                        error_message = f"更新队列状态时出错：{str(e)}"
-                        print(f"[错误信息] {error_message}")
-                        yield [], "", "", 0, ""
-                        i += 1
-                        continue
-                    
-                    # 实时更新队列状态，UI消息为空
-                    yield queue_data, "", "", 0, ""
-                    
-                    # 获取参数
-                    try:
-                        params = queue_item['params']
-                        video_file = queue_item['file_path']
-                    except Exception as e:
-                        error_message = f"获取队列项参数时出错：{str(e)}"
-                        print(f"[错误信息] {error_message}")
-                        self.video_queue[i]['status'] = '失败'
-                        queue_data = [[item['filename'], item['status']] for item in self.video_queue]
-                        yield queue_data, "", "", 0, ""
-                        i += 1
-                        continue
-                    
-                    # 清空日志和进度状态
-                    try:
-                        self.logs = []
-                        self.progress = 0
+                        os.remove(os.path.join(TEMP_DIR, f))
                     except:
                         pass
-                    
-                    # 调用通用处理函数
-                    print("[队列处理] 开始处理视频文件...")
-                    success, message, output_path, logs = self.process_video(video_file, params)
-                    
-                    # 打印消息到终端
-                    print(f"[队列处理] 处理结果: {message}")
-                    print(f"[队列处理] 日志数量: {len(logs)}")
-                    print(f"[队列处理] 成功状态: {success}")
-                    
-                    # 更新队列状态
-                    if success:
-                        self.video_queue[i]['status'] = '已完成'
-                    else:
-                        self.video_queue[i]['status'] = '失败'
-                    
-                    # 更新队列数据
-                    try:
-                        queue_data = []
-                        for item in self.video_queue:
-                            try:
-                                # 检查item是否有必要的键
-                                if isinstance(item, dict) and 'filename' in item and 'status' in item:
-                                    filename = item['filename'] if item['filename'] else '未知文件名'
-                                    status = item['status'] if item['status'] else '未知状态'
-                                    queue_data.append([filename, status])
-                                else:
-                                    print(f"[错误信息] 队列项格式错误: {item}")
-                                    queue_data.append(['格式错误', '错误'])
-                            except Exception as item_error:
-                                print(f"[错误信息] 处理队列项时出错: {item_error}")
-                                queue_data.append(['处理错误', '错误'])
-                        current_total = len(self.video_queue)
-                        queue_status_text = f"已完成队列中的第 {i+1}/{current_total} 个文件：{current_filename}"
-                        # 打印到终端
-                        print(f"[队列状态] {queue_status_text}")
-                    except Exception as e:
-                        error_msg = f"更新队列数据时出错：{str(e)}"
-                        print(f"[错误信息] {error_msg}")
-                        queue_data = []
-                        queue_status_text = error_msg
-                    
-                    # 实时更新UI，消息为空
-                    yield queue_data, "", '\n'.join(logs), 100, ""
-                    
-                    # 清理资源，准备处理下一个视频
-                    try:
-                        # 确保所有进程都已终止
-                        print("[资源管理] 清理资源，准备处理下一个视频...")
-                        # 执行垃圾回收
-                        import gc
-                        gc.collect()
-                        gc.collect()  # 再次执行，确保完全释放
-                        print("[资源管理] 已执行垃圾回收")
-                    except Exception as e:
-                        print(f"[错误信息] 清理资源时出错：{str(e)}")
-                    
-                    # 减少延迟时间，同时确保资源释放
-                    time.sleep(0.5)  # 减少到0.5秒，平衡资源释放和处理速度
-                    
-                    # 处理完当前视频，增加索引
-                    i += 1
-                
-                # 处理完成
-                try:
-                    actual_processed = len(self.video_queue)
-                    queue_status_text = f"队列处理完成，共处理了 {actual_processed} 个文件"
-                    print(f"[队列状态] {queue_status_text}")
-                    yield [[item['filename'], item['status']] for item in self.video_queue], "", '\n'.join(self.logs), 100, ""
-                except Exception as e:
-                    error_msg = f"队列处理完成时出错：{str(e)}"
-                    print(f"[错误信息] {error_msg}")
-                    yield [], "", "", 0, ""
-            finally:
-                self.queue_processing = False
-                self.current_queue_index = -1
-                # 清空日志和进度状态
-                try:
-                    self.logs = []
-                    self.progress = 0
-                except:
-                    pass
-                # 清理模型缓存，释放内存
-                try:
-                    print("[资源管理] 清理模型缓存...")
-                    clear_model_cache()
-                    clear_translator_cache()
-                except Exception as e:
-                    print(f"[错误信息] 清理模型缓存时出错：{str(e)}")
-        except Exception as e:
-            # 处理整体异常，只打印到终端，不显示在UI中
-            import traceback
-            error_message = f"处理队列时出错：{str(e)}"
-            error_detail = f"详细错误：{traceback.format_exc()}"
-            print(f"[错误信息] {error_message}")
-            print(f"[错误信息] {error_detail}")
+            self._cleanup(params['device'])
             
-            try:
-                self.log_message(error_message)
-                self.log_message(error_detail)
-            except:
-                pass
-            finally:
-                self.queue_processing = False
-                self.current_queue_index = -1
-                # 清空日志和进度状态
-                try:
-                    self.logs = []
-                    self.progress = 0
-                except:
-                    pass
-                # 清理模型缓存，释放内存
-                try:
-                    print("[资源管理] 清理模型缓存...")
-                    clear_model_cache()
-                    clear_translator_cache()
-                except Exception as e:
-                    print(f"[错误信息] 清理模型缓存时出错：{str(e)}")
-            # UI消息为空
+            if os.path.exists(output_path):
+                return True, "处理成功！", output_path, self.logs
+            return False, "字幕文件未生成", None, self.logs
+            
+        except Exception as e:
+            import traceback
+            log(f"[错误] 处理失败: {e}\n{traceback.format_exc()}")
+            self.add_log(f"处理失败: {e}")
+            self._cleanup(params.get('device', 'cpu'))
+            return False, f"处理错误: {e}", None, self.logs
+    
+    def process_queue(self):
+        log(f"\n{'='*80}\n[队列] 开始处理，共 {len(self.video_queue)} 个文件")
+        
+        if not self.video_queue:
             yield [], "", "", 0, ""
+            return
+        
+        if self.processing:
+            yield [[i['filename'], i['status']] for i in self.video_queue], "", "", 0, ""
+            return
+        
+        self.processing = True
+        
+        try:
+            for i, item in enumerate(self.video_queue):
+                self.video_queue[i]['status'] = '处理中'
+                log(f"[队列] 处理第 {i+1}/{len(self.video_queue)} 个: {item['filename']}")
+                yield [[j['filename'], j['status']] for j in self.video_queue], "", "", 0, ""
+                
+                self.logs = []
+                success, msg, output, logs = self.process_video(item['file_path'], item['params'])
+                log(f"[队列] 结果: {msg}")
+                
+                self.video_queue[i]['status'] = '已完成' if success else '失败'
+                yield [[j['filename'], j['status']] for j in self.video_queue], "", "\n".join(logs), 100, ""
+                
+                gc.collect()
+                time.sleep(0.5)
+            
+            log(f"[队列] 处理完成，共 {len(self.video_queue)} 个文件")
+            yield [[i['filename'], i['status']] for i in self.video_queue], "", "\n".join(self.logs), 100, ""
+            
+        except Exception as e:
+            log(f"[错误] 队列处理失败: {e}")
+            yield [], "", "", 0, ""
+        
+        finally:
+            self.processing = False
+            self.logs = []
+            clear_model_cache()
+            clear_translator_cache()
 
-# 创建队列管理器实例
 queue_manager = QueueManager()
