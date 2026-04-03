@@ -52,7 +52,7 @@
 
 2. **第一步：运行安装脚本**
    ```bash
-   venv_setup.bat
+   venv_setup.bat（用管理员身份运行）
    ```
 
    这个脚本会自动：
