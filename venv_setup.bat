@@ -124,8 +124,8 @@ if exist "requirements.txt" (
     
     :: Install WhisperX
     echo.
-    echo Installing WhisperX 3.8.1...
-    "%VENV_NAME%\Scripts\pip.exe" install whisperx==3.8.1 2>nul || echo [WARN] WhisperX may need manual install
+    echo Installing WhisperX 3.8.4...
+    "%VENV_NAME%\Scripts\pip.exe" install whisperx==3.8.4 2>nul || echo [WARN] WhisperX may need manual install
     
     :: Install other packages
     echo.
