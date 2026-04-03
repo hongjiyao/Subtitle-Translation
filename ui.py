@@ -34,48 +34,72 @@ def create_ui():
         with gr.Tabs():
             # 第一个标签页：视频处理
             with gr.TabItem("视频处理"):
+                gr.Markdown("### 📹 视频文件处理")
+                gr.Markdown("上传视频文件，添加到队列并开始处理")
+                
                 with gr.Row():
-                    # 左侧：输入和配置
+                    # 左侧：输入和控制
                     with gr.Column(scale=1):
+                        # 视频上传区域
+                        gr.Markdown("#### 上传视频")
                         video_input = gr.File(
-                            label="上传视频文件",
+                            label="选择视频文件",
                             file_types=[".mp4", ".avi", ".mov", ".mkv", ".webm"],
-                            type="filepath"
+                            type="filepath",
+                            file_count="multiple"
                         )
                         
-                        # 处理按钮
-                        process_btn = gr.Button("开始处理", variant="primary", size="lg")
+
                         
-                        # 队列管理按钮
+                        # 控制按钮区域
+                        gr.Markdown("#### 操作控制")
+                        with gr.Row():
+                            process_btn = gr.Button("开始处理", variant="primary", size="lg")
+                        
                         with gr.Row():
                             add_queue_btn = gr.Button("添加到队列", variant="secondary")
                             clear_queue_btn = gr.Button("清空队列", variant="secondary")
                         
                         # 状态显示
-                        status_msg = gr.Textbox(label="状态", interactive=False, lines=3)
+                        gr.Markdown("#### 处理状态")
+                        status_msg = gr.Textbox(
+                            label="状态信息", 
+                            interactive=False, 
+                            lines=4,
+                            placeholder="处理状态将显示在这里..."
+                        )
                     
                     # 右侧：队列和输出
-                    with gr.Column(scale=1):
+                    with gr.Column(scale=2):
+                        # 队列统计
+                        with gr.Row():
+                            queue_stats = gr.Textbox(
+                                label="队列统计",
+                                value=f"当前队列: 0 个文件",
+                                interactive=False
+                            )
+                        
                         # 队列列表
-                        gr.Markdown("### 处理队列")
+                        gr.Markdown("#### 处理队列")
                         queue_list = gr.Dataframe(
                             headers=["ID", "文件", "状态", "进度"],
                             label="队列",
                             interactive=False
                         )
                         
-                        # 处理队列按钮
-                        process_queue_btn = gr.Button("处理队列", variant="primary")
+                        # 队列操作
+                        with gr.Row():
+                            process_queue_btn = gr.Button("处理队列", variant="primary", size="lg")
                         
                         # 输出文件
-                        output_files = gr.File(label="输出文件", interactive=False)
-                        
-                        # 语言检测结果显示
-                        lang_mode = gr.Textbox(
-                            label="语言检测模式",
-                            value="自动检测" if all_config.get('source_language') == 'auto' else "手动选择",
-                            interactive=False
+                        gr.Markdown("#### 输出文件")
+                        output_files = gr.File(
+                            label="生成的字幕文件", 
+                            interactive=False,
+                            file_count="multiple"
                         )
+                        
+
             
             # 第二个标签页：详细配置
             with gr.TabItem("详细配置"):
@@ -410,10 +434,26 @@ def create_ui():
                     """)
         
         # 事件处理
+        
         # 队列管理
+        def format_queue_for_display():
+            """将队列格式化为Dataframe显示的格式 [[ID, 文件名, 状态, 进度], ...]"""
+            result = []
+            for i, item in enumerate(queue_manager.video_queue):
+                result.append([
+                    i + 1,  # ID
+                    item.get('filename', ''),  # 文件名
+                    item.get('status', '等待中'),  # 状态
+                    "-"  # 进度
+                ])
+            return result
+        
         def add_to_queue(video):
             if not video:
-                return queue_manager.get_queue(), "请先上传视频文件"
+                return format_queue_for_display(), "请先上传视频文件", f"当前队列: {len(queue_manager.video_queue)} 个文件", None
+            
+            # 处理多文件上传
+            files = video if isinstance(video, list) else [video]
             params = {
                 'model': all_config.get('model', 'medium'),
                 'translator': all_config.get('translator', 'tencent/HY-MT1.5-7B-GGUF'),
@@ -428,33 +468,61 @@ def create_ui():
                 'translation_batch_size': all_config.get('translation_batch_size', 4096),
                 'translation_context_size': all_config.get('translation_context_size', 4096)
             }
-            count = queue_manager.add_to_queue(video, params)
-            return queue_manager.get_queue(), f"已添加 {count} 个文件到队列"
+            
+            for file in files:
+                queue_manager.add_to_queue(file, params)
+            
+            count = len(queue_manager.video_queue)
+            return format_queue_for_display(), f"已添加 {len(files)} 个文件到队列", f"当前队列: {count} 个文件", None
         
         def clear_queue():
             queue_manager.clear_queue()
-            return queue_manager.get_queue(), "队列已清空"
+            return format_queue_for_display(), "队列已清空", "当前队列: 0 个文件", None
         
         def process_queue():
             if not queue_manager.video_queue:
-                return queue_manager.get_queue(), "队列为空"
-            # 处理队列中的第一个文件
-            item = queue_manager.video_queue[0]
-            item['status'] = '处理中'
-            success, msg, output, logs = queue_manager.process_video(item['file_path'], item['params'])
-            if success:
-                item['status'] = '完成'
-            else:
-                item['status'] = f'失败: {msg}'
-            return queue_manager.get_queue(), "\n".join(logs)
+                return format_queue_for_display(), "队列为空", f"当前队列: {len(queue_manager.video_queue)} 个文件", None
+            
+            all_logs = []
+            last_output = None
+            
+            # 循环处理队列中的所有视频
+            while queue_manager.video_queue:
+                item = queue_manager.video_queue[0]  # 每次取第一个
+                item['status'] = '处理中'
+                success, msg, output, logs = queue_manager.process_video(item['file_path'], item['params'])
+                
+                all_logs.extend(logs)
+                if output:
+                    last_output = output
+                
+                # 处理完成后从队列中移除
+                if success:
+                    item['status'] = '完成'
+                    queue_manager.video_queue.pop(0)  # 移除已处理的视频
+                else:
+                    item['status'] = f'失败: {msg}'
+                    break  # 遇到错误停止
+            
+            remaining = len(queue_manager.video_queue)
+            return format_queue_for_display(), "\n".join(all_logs), f"当前队列: {remaining} 个文件", last_output
         
+
+        
+        # 队列管理按钮
         add_queue_btn.click(
             fn=add_to_queue,
             inputs=[video_input],
-            outputs=[queue_list, status_msg]
+            outputs=[queue_list, status_msg, queue_stats, output_files]
         )
-        clear_queue_btn.click(fn=clear_queue, outputs=[queue_list, status_msg])
-        process_btn.click(fn=process_queue, outputs=[queue_list, status_msg])
+        clear_queue_btn.click(
+            fn=clear_queue,
+            outputs=[queue_list, status_msg, queue_stats, output_files]
+        )
+        process_btn.click(
+            fn=process_queue,
+            outputs=[queue_list, status_msg, queue_stats, output_files]
+        )
         
         # 保存所有参数
         def do_save_all(model, translator, translator_quantization, device, source_language, target_language,
