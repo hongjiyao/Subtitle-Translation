@@ -161,7 +161,7 @@ Subtitle-TranslationA/
 
 ## 致谢
 
-```
+
 - **OpenAI**：Whisper模型
 - **腾讯**：HY-MT1.5-7B-GGUF模型
 - **Gradio**：Web界面框架
