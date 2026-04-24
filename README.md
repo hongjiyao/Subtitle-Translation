@@ -5,6 +5,7 @@
 ## 项目概述
 
 Subtitle-TranslationA 是一款专业的视频字幕翻译工具，利用最新的Whisper-CD实现高精度的语音识别。
+视频链接：【B站首发Whisper-CD算法实现】 
 
 ### 核心功能
 
