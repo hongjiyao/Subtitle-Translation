@@ -12,6 +12,11 @@ from pathlib import Path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
+# 自动设置本地 ffmpeg 到 PATH
+ffmpeg_local = project_root / "ffmpeg" / "ffmpeg-master-latest-win64-gpl" / "bin"
+if os.path.exists(ffmpeg_local):
+    os.environ["PATH"] = str(ffmpeg_local) + os.pathsep + os.environ.get("PATH", "")
+
 from config import config, MODEL_OPTIONS, TRANSLATOR_MAP, LANGUAGE_OPTIONS, DEVICE_OPTIONS
 from utils.queue_manager import QueueManager
 
