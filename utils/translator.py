@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
+
+
 import os
 import time
+import datetime
+import gc
+import re
+
+from utils.llama_server_manager import LlamaServerManager
+from utils.language_ratio_detector import check_translation_success, get_translation_quality_info
 
 # 强制使用 UTF-8 编码
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 os.environ['LC_ALL'] = 'en_US.UTF-8'
 os.environ['LANG'] = 'en_US.UTF-8'
-
-import datetime
-import gc
-import subprocess
-import glob
 
 # 设置HF-Mirror作为下载源
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -29,500 +32,43 @@ def timestamp_print(message):
 
 
 def clear_translator_cache():
-    """清空翻译模型缓存以释放内存"""
+    """清空翻译模型缓存以释放内存并停止服务器进程"""
+    # 停止llama-server进程
+    try:
+        import subprocess
+        # 使用taskkill命令强制停止llama-server进程
+        subprocess.run(["taskkill", "/F", "/IM", "llama-server.exe"], capture_output=True, text=True)
+        timestamp_print("[llama-server] 已停止服务器进程")
+    except Exception as e:
+        timestamp_print(f"[llama-server] 停止服务器时出错: {e}")
+    
     gc.collect()
     timestamp_print("[内存管理] 已执行垃圾回收")
 
 
 class LlamaCppTranslator:
-    """使用 llama-completion.exe 运行 GGUF 模型的翻译器 - 单例模式"""
-    _instance = None
-    _initialized = False
-
-    def __new__(cls, model_path=None):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+    """使用 llama-server HTTP API 运行 GGUF 模型的翻译器"""
 
     def __init__(self, model_path=None):
-        if not self._initialized:
-            # 查找 llama-completion.exe 路径（非交互式版本更稳定）
-            self.llama_cli_path = self._find_llama_cli()
-            if not self.llama_cli_path:
-                raise RuntimeError("找不到 llama-completion.exe 或 llama-cli.exe，请确保 llama_cpp 目录存在")
-
-            # 查找 GGUF 模型文件
-            self.model_path = model_path or self._find_gguf_model()
-            if not self.model_path:
-                raise RuntimeError("找不到 GGUF 模型文件，请确保模型已下载")
-
-            # 从配置中获取上下文大小
-            from config import config
-            self.context_size = config.get('translation_context_size', 10000)
-            self.process = None
-            self.stdin = None
-            self.stdout = None
-            self.stderr = None
-
-            timestamp_print(f"[llama.cpp翻译] 翻译器: {self.llama_cli_path}")
-            timestamp_print(f"[llama.cpp翻译] 模型: {self.model_path}")
-            timestamp_print(f"[llama.cpp翻译] 默认上下文大小: {self.context_size}")
-            self._initialized = True
-
-    def start_process(self, context_size=None):
-        """启动持久化的 llama 进程 - 使用标准输入/输出实现"""
-        # 检查是否已有进程在运行
-        if self.process and self.process.poll() is None:
-            timestamp_print("[llama.cpp翻译] 服务器进程已经在运行")
-            return True
-
-        # 使用配置中的上下文大小作为默认值
-        if context_size is None:
-            context_size = self.context_size
-
-        max_attempts = 3
-        attempt = 0
+        # 翻译的系统提示词
+        system_prompt = "You are a translator. Your only task is to translate the given text from the source language to the target language. Output only the translation, nothing else. Do not include any instructions or explanations in your response."
+        # 使用默认端口
+        self.server_manager = LlamaServerManager(system_prompt=system_prompt, port=8080)
         
-        while attempt < max_attempts:
-            attempt += 1
-            timestamp_print(f"[llama.cpp翻译] 尝试启动服务器进程 (尝试 {attempt}/{max_attempts})...")
-            
-            try:
-                # 从配置获取翻译参数
-                from config import config
-                temperature = config.get('translation_temperature', 0.05)
-                top_k = config.get('translation_top_k', 40)
-                top_p = config.get('translation_top_p', 0.95)
-                repetition_penalty = config.get('translation_repetition_penalty', 1.0)
-                
-                # 构建命令 - 使用简单IO模式
-                cmd = [
-                    self.llama_cli_path,
-                    "-m", self.model_path,
-                    "-t", "8",  
-                    "-c", str(context_size),
-                    "--temp", str(temperature),
-                    "--top-p", str(top_p),
-                    "--top-k", str(top_k),
-                    "--repeat-penalty", str(repetition_penalty),
-                    "-ngl", "99",
-                    "--simple-io",
-                    "--no-display-prompt"
-                ]
-
-                timestamp_print(f"[llama.cpp翻译] 启动命令: {' '.join(cmd)}")
-                timestamp_print(f"[llama.cpp翻译] 模型路径: {self.model_path}")
-                timestamp_print(f"[llama.cpp翻译] 上下文大小: {context_size}")
-                
-                # 检查文件是否存在
-                if not os.path.exists(self.llama_cli_path):
-                    timestamp_print(f"[llama.cpp翻译] 错误: llama-completion.exe 不存在: {self.llama_cli_path}")
-                    return False
-                
-                if not os.path.exists(self.model_path):
-                    timestamp_print(f"[llama.cpp翻译] 错误: 模型文件不存在: {self.model_path}")
-                    return False
-                
-                # 启动进程
-                timestamp_print("[llama.cpp翻译] 正在启动进程...")
-                self.process = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding='utf-8',
-                    errors='ignore',
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
-                )
-
-                self.stdin = self.process.stdin
-                self.stdout = self.process.stdout
-                self.stderr = self.process.stderr
-
-                timestamp_print("[llama.cpp翻译] 进程已启动，进程ID: " + str(self.process.pid))
-                
-                # 等待进程启动
-                timestamp_print("[llama.cpp翻译] 等待进程初始化...")
-                time.sleep(5)  # 增加等待时间确保进程完全启动
-                
-                # 检查进程是否仍在运行
-                if self.process and self.process.poll() is None:
-                    timestamp_print("[llama.cpp翻译] 服务器进程启动成功")
-                    
-                    # 尝试读取初始输出
-                    try:
-                        if self.stderr:
-                            # 尝试读取错误输出
-                            import msvcrt
-                            if msvcrt.kbhit():
-                                stderr_output = self.stderr.read(1024)
-                                if stderr_output:
-                                    timestamp_print(f"[llama.cpp翻译] 服务器启动错误输出: {stderr_output[:200]}...")
-                    except Exception as e:
-                        pass
-                    
-                    # 不发送测试命令，直接返回成功
-                    # 测试命令可能会导致卡住，我们将在实际翻译时处理错误
-                    timestamp_print("[llama.cpp翻译] 服务器进程启动成功，跳过测试命令")
-                    return True
-                else:
-                    exit_code = self.process.poll() if self.process else "None"
-                    timestamp_print(f"[llama.cpp翻译] 服务器进程启动后立即退出，退出码: {exit_code}")
-                    
-                    # 尝试读取错误输出
-                    try:
-                        if self.stderr:
-                            stderr_output = self.stderr.read(1024)
-                            if stderr_output:
-                                timestamp_print(f"[llama.cpp翻译] 退出原因: {stderr_output}")
-                    except Exception as e:
-                        pass
-                    
-                    self.stop_process()
-                    
-            except Exception as e:
-                timestamp_print(f"[llama.cpp翻译] 启动服务器进程失败: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                self.stop_process()
-            
-            # 等待一段时间后重试
-            if attempt < max_attempts:
-                timestamp_print(f"[llama.cpp翻译] 5秒后重试...")
-                time.sleep(5)
-        
-        timestamp_print("[llama.cpp翻译] 服务器进程启动失败，达到最大尝试次数")
-        return False
-
-    def _read_output(self, timeout=60.0):
-        """读取进程输出 - 持续尝试直到成功，添加超时机制"""
-        if not self.stdout:
-            timestamp_print("[llama.cpp翻译] 错误: 标准输出流未初始化")
-            return b""
-
-        output = []
-        start_time = time.time()
-        
-        # 确保进程仍在运行
-        if not self.process or self.process.poll() is not None:
-            exit_code = self.process.poll() if self.process else "None"
-            timestamp_print(f"[llama.cpp翻译] 错误: 服务器进程已退出，退出码: {exit_code}")
-            # 尝试读取错误输出
-            try:
-                if self.stderr:
-                    stderr_output = self.stderr.read(1024)
-                    if stderr_output:
-                        timestamp_print(f"[llama.cpp翻译] 进程退出原因: {stderr_output}")
-            except Exception as e:
-                pass
-            return b""
-        
-        timestamp_print(f"[llama.cpp翻译] 开始读取服务器输出 (超时: {timeout}秒)...")
-        
-        # 循环读取直到超时或收到足够的输出
-        while time.time() - start_time < timeout:
-            # 检查进程是否仍在运行
-            if self.process and self.process.poll() is not None:
-                exit_code = self.process.poll()
-                timestamp_print(f"[llama.cpp翻译] 错误: 服务器进程在读取过程中退出，退出码: {exit_code}")
-                # 尝试读取错误输出
-                try:
-                    if self.stderr:
-                        stderr_output = self.stderr.read(1024)
-                        if stderr_output:
-                            timestamp_print(f"[llama.cpp翻译] 进程退出原因: {stderr_output}")
-                except Exception as e:
-                    pass
-                break
-            
-            try:
-                # 尝试读取输出
-                if os.name == 'nt':
-                    # Windows 平台：使用更简单的读取方式
-                    # 使用非阻塞读取
-                    import msvcrt
-                    
-                    # 检查是否有数据可读
-                    if msvcrt.kbhit():
-                        # 尝试读取数据
-                        data = self.stdout.read(1024)
-                        if data:
-                            output.append(data.encode('utf-8', errors='ignore'))
-                            timestamp_print(f"[llama.cpp翻译] 读取到 {len(data)} 字节数据")
-                            # 检查是否已收到足够的输出
-                            output_str = b''.join(output).decode('utf-8', errors='ignore')
-                            if len(output_str) > 50 or '\n' in output_str:
-                                timestamp_print("[llama.cpp翻译] 收到完整输出")
-                                break
-                        else:
-                            timestamp_print("[llama.cpp翻译] 警告: 读取到空数据")
-                    else:
-                        # 没有数据可读，短暂睡眠
-                        time.sleep(0.1)
-                else:
-                    # Unix 平台：使用 select
-                    import select
-                    ready, _, _ = select.select([self.stdout], [], [], 0.1)
-                    if ready:
-                        data = self.stdout.read(1024)
-                        if data:
-                            output.append(data.encode('utf-8', errors='ignore'))
-                            timestamp_print(f"[llama.cpp翻译] 读取到 {len(data)} 字节数据")
-                            # 检查是否已收到足够的输出
-                            output_str = b''.join(output).decode('utf-8', errors='ignore')
-                            if len(output_str) > 50 or '\n' in output_str:
-                                timestamp_print("[llama.cpp翻译] 收到完整输出")
-                                break
-            except Exception as e:
-                timestamp_print(f"[llama.cpp翻译] 读取输出时发生异常: {str(e)}")
-                # 不打印完整堆栈，避免输出过多
-                # 继续尝试读取
-                time.sleep(0.1)
-            
-            # 检查超时
-            elapsed = time.time() - start_time
-            remaining = timeout - elapsed
-            if remaining < 0:
-                break
-        
-        result = b''.join(output)
-        if result:
-            output_str = result.decode('utf-8', errors='ignore')
-            timestamp_print(f"[llama.cpp翻译] 收到输出: {output_str[:100]}...")
-        else:
-            timestamp_print("[llama.cpp翻译] 错误: 未收到任何输出")
-            # 尝试读取错误输出
-            try:
-                if self.stderr:
-                    stderr_output = self.stderr.read(1024)
-                    if stderr_output:
-                        timestamp_print(f"[llama.cpp翻译] 错误输出: {stderr_output}")
-            except Exception as e:
-                pass
-        
-        return result
-
-    def _send_command(self, command):
-        """发送命令到服务器 - 使用标准输入"""
-        if not self.stdin or not self.process or self.process.poll() is not None:
-            timestamp_print("[llama.cpp翻译] 服务器进程未就绪，无法发送命令")
-            # 尝试重新启动进程
-            if not self.start_process():
-                return False
-
-        try:
-            timestamp_print("[llama.cpp翻译] 发送命令到服务器...")
-            # 发送命令
-            self.stdin.write(command + '\n')
-            self.stdin.flush()
-            timestamp_print("[llama.cpp翻译] 命令发送成功")
-            return True
-        except Exception as e:
-            timestamp_print(f"[llama.cpp翻译] 发送命令失败: {str(e)}")
-            # 尝试重新启动进程
-            if self.start_process():
-                # 重新发送命令
-                try:
-                    self.stdin.write(command + '\n')
-                    self.stdin.flush()
-                    timestamp_print("[llama.cpp翻译] 重新发送命令成功")
-                    return True
-                except Exception as e2:
-                    timestamp_print(f"[llama.cpp翻译] 重新发送命令失败: {str(e2)}")
-                    return False
-            return False
-
-    def stop_process(self):
-        """停止持久化进程"""
-        if self.process and self.process.poll() is None:
-            try:
-                # 发送退出命令
-                if self.stdin:
-                    try:
-                        self.stdin.write('\\q\n')
-                        self.stdin.flush()
-                    except:
-                        pass
-                
-                # 等待进程退出
-                self.process.wait(timeout=5)
-            except Exception as e:
-                timestamp_print(f"[llama.cpp翻译] 停止进程失败: {str(e)}")
-                # 强制终止
-                try:
-                    self.process.terminate()
-                    self.process.wait(timeout=3)
-                except:
-                    pass
-            finally:
-                self.process = None
-                self.stdin = None
-                self.stdout = None
-                self.stderr = None
-                timestamp_print("[llama.cpp翻译] 服务器进程已停止")
-
-    def _find_llama_cli(self):
-        """查找 llama-cli.exe 或 llama-completion.exe 路径"""
-        # 优先使用 llama-completion（非交互式，更稳定）
-        possible_paths = [
-            os.path.join(PROJECT_ROOT, "llama_cpp", "llama-completion.exe"),
-            os.path.join(PROJECT_ROOT, "llama_cpp", "llama-cli.exe"),
-            os.path.join(PROJECT_ROOT, "llama_cpp", "build", "llama-completion.exe"),
-            os.path.join(PROJECT_ROOT, "llama_cpp", "build", "llama-cli.exe"),
-        ]
-
-        for path in possible_paths:
-            if os.path.exists(path):
-                return path
-
-        # 搜索 llama_cpp 目录下的所有可执行文件
-        for exe_name in ["llama-completion.exe", "llama-cli.exe"]:
-            search_pattern = os.path.join(PROJECT_ROOT, "llama_cpp", "**", exe_name)
-            found = glob.glob(search_pattern, recursive=True)
-            if found:
-                return found[0]
-
-        return None
-
-    def _find_gguf_model(self):
-        """查找 GGUF 模型文件 - 根据配置选择量化版本"""
         from config import config
+        self.context_size = config.get('translation_context_size', 8192)
         
-        # 获取量化配置
-        quantization = config.get('translator_quantization', 'auto')
-        timestamp_print(f"[llama.cpp翻译] 量化配置: {quantization}")
-        
-        # 优先查找腾讯翻译模型
-        model_dirs = [
-            os.path.join(MODEL_CACHE_DIR, "tencent--HY-MT1.5-7B-GGUF"),
-            os.path.join(MODEL_CACHE_DIR, "HY-MT1.5-7B-GGUF"),
-        ]
+        timestamp_print(f"[llama-server翻译] 使用 HTTP API: {self.server_manager.host}:{self.server_manager.port}")
+        timestamp_print(f"[llama-server翻译] 模型: {self.server_manager.model_path}")
+        timestamp_print(f"[llama-server翻译] 默认上下文大小: {self.context_size}")
 
-        for model_dir in model_dirs:
-            if os.path.exists(model_dir):
-                # 查找 .gguf 文件
-                gguf_files = glob.glob(os.path.join(model_dir, "*.gguf"))
-                if gguf_files:
-                    # 如果指定了具体量化版本，优先选择该版本
-                    if quantization != "auto":
-                        for f in gguf_files:
-                            if quantization in f:
-                                timestamp_print(f"[llama.cpp翻译] 选择指定量化模型: {os.path.basename(f)}")
-                                return f
-                        # 如果没有找到指定版本，打印警告并回退到自动选择
-                        timestamp_print(f"[llama.cpp翻译警告] 未找到指定量化版本 {quantization}，回退到自动选择")
-                    
-                    # 自动选择：优先选择量化程度最高的版本（体积最小）
-                    for preferred in ["Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_K_S", "Q4_K_M", "Q5_0", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0"]:
-                        for f in gguf_files:
-                            if preferred in f:
-                                timestamp_print(f"[llama.cpp翻译] 自动选择模型: {os.path.basename(f)}")
-                                return f
-                    # 如果没有找到首选版本，返回第一个
-                    timestamp_print(f"[llama.cpp翻译] 使用默认模型: {os.path.basename(gguf_files[0])}")
-                    return gguf_files[0]
-
-        # 搜索所有 GGUF 文件
-        search_pattern = os.path.join(MODEL_CACHE_DIR, "**", "*.gguf")
-        found = glob.glob(search_pattern, recursive=True)
-        if found:
-            # 如果指定了具体量化版本，尝试匹配
-            if quantization != "auto":
-                for f in found:
-                    if quantization in f:
-                        timestamp_print(f"[llama.cpp翻译] 选择指定量化模型: {os.path.basename(f)}")
-                        return f
-            # 选择最小的文件
-            smallest_file = min(found, key=os.path.getsize)
-            timestamp_print(f"[llama.cpp翻译] 自动选择最小模型: {os.path.basename(smallest_file)}")
-            return smallest_file
-
-        return None
-
-    def translate(self, text, source_lang="en", target_lang="zh", context_size=20000):
-        """翻译单个文本 - 使用与批量翻译相同的exe"""
-        # 直接调用批量翻译的回退方法，确保使用相同的exe
-        return self._translate_multi_fallback([text], source_lang, target_lang, context_size)[0]
-
-    def _find_repeated_sequences(self, text: str, min_repeat: int = 2) -> list:
-        """
-        自动识别文本中的重复字符序列
-        
-        返回: [(重复序列, 重复次数, 起始位置), ...]
-        """
-        sequences = []
-        i = 0
-        n = len(text)
-        
-        while i < n:
-            # 处理单字符重复（包括标点符号）
-            if n - i >= 3:
-                # 检查单字符重复
-                current_char = text[i]
-                repeat_count = 1
-                j = i + 1
-                while j < n and text[j] == current_char:
-                    repeat_count += 1
-                    j += 1
-                if repeat_count >= 3:  # 单字符重复至少3次（包括标点符号）
-                    sequences.append((current_char, repeat_count, i))
-                    i = j
-                    continue
-            
-            # 特殊处理包含标点的单字符重复序列
-            # 检查常见的单字符+标点模式
-            if n - i >= 2:
-                # 检查模式: 字符+标点
-                if i + 4 <= n:
-                    # 检查 あ、あ、 模式
-                    if text[i:i+2] == text[i+2:i+4]:
-                        seq = text[i:i+2]  # 单字符+标点
-                        repeat_count = 2
-                        j = i + 4
-                        while j + 2 <= n and text[j:j+2] == seq:
-                            repeat_count += 1
-                            j += 2
-                        if repeat_count >= 3:  # 重复次数达到3次及以上才进行压缩
-                            sequences.append((seq, repeat_count + 1, i))
-                            i = j
-                            continue
-            
-            # 双字符重复和双字符+标点重复已合并到长序列重复处理中
-            
-            # 尝试不同长度的序列
-            # 从较长的序列开始检查，这样可以识别包含标点的重复序列
-            found = False
-            for seq_len in range(min(10, n - i), 1, -1):  # 从长到短检查，包括长度为2的序列
-                seq = text[i:i + seq_len]
-                
-                # 计算该序列连续重复的次数
-                repeat_count = 1
-                j = i + seq_len
-                while j + seq_len <= n and text[j:j + seq_len] == seq:
-                    repeat_count += 1
-                    j += seq_len
-                
-                # 如果重复次数达到阈值，记录该序列
-                if repeat_count >= 3:
-                    sequences.append((seq, repeat_count, i))
-                    i = j  # 跳过已处理的重复部分
-                    found = True
-                    break
-            
-            # 如果没有找到重复序列，移动到下一个字符
-            if not found:
-                i += 1
-        
-        return sequences
-
-    def _compress_repeated_sequences(self, text: str, keep_count: int = 2) -> str:
+    def compress_repeated_sequences(self, text: str, keep_count: int = 1) -> str:
         """
         压缩文本中的重复字符序列
         
         Args:
             text: 原始文本
-            keep_count: 保留的重复次数（默认保留2个）
+            keep_count: 保留的重复次数（默认保留1个）
         
         Returns:
             压缩后的文本
@@ -530,52 +76,60 @@ class LlamaCppTranslator:
         if not text:
             return text
         
-        sequences = self._find_repeated_sequences(text)
+        sequences = []
+        i = 0
+        n = len(text)
+        
+        while i < n:
+            if n - i >= 3:
+                current_char = text[i]
+                repeat_count = 1
+                j = i + 1
+                while j < n and text[j] == current_char:
+                    repeat_count += 1
+                    j += 1
+                if repeat_count >= 3:
+                    sequences.append((current_char, repeat_count, i))
+                    i = j
+                    continue
+            
+            found = False
+            for seq_len in range(min(10, n - i), 1, -1):
+                seq = text[i:i + seq_len]
+                repeat_count = 1
+                j = i + seq_len
+                while j + seq_len <= n and text[j:j + seq_len] == seq:
+                    repeat_count += 1
+                    j += seq_len
+                
+                if repeat_count >= 3:
+                    sequences.append((seq, repeat_count, i))
+                    i = j
+                    found = True
+                    break
+            
+            if not found:
+                i += 1
         
         if not sequences:
             return text
         
-        # 按位置排序（从后往前处理，避免位置偏移问题）
         sequences.sort(key=lambda x: x[2], reverse=True)
         
         result = text
         for seq, repeat_count, start_pos in sequences:
-            # 只保留指定数量的重复
-            if len(seq) == 3 and seq[-1] in ',!?.':
-                # 对于双字符+标点的序列（长度为3），特殊处理
-                # 保留 keep_count 个序列，但去掉最后一个标点
-                keep_seq = (seq * keep_count)[:-1]
-            elif len(seq) == 2 and seq[-1] in ',!?.':
-                # 对于单字符+标点的序列（长度为2），特殊处理
-                # 保留 keep_count 个序列，但去掉最后一个标点
-                keep_seq = (seq * keep_count)[:-1]
-            elif len(seq) == 1:
-                # 对于单字符重复（包括标点符号），直接保留指定数量
-                keep_seq = seq * keep_count
-            else:
-                # 其他序列正常处理
-                keep_seq = seq * keep_count
-            
-            # 计算实际的原始长度，确保不超出文本长度
+            keep_seq = seq * keep_count
             original_len = len(seq) * repeat_count
-            # 确保原始长度不超出文本长度
             max_len = len(result) - start_pos
             original_len = min(original_len, max_len)
-            
-            # 替换重复序列
             result = result[:start_pos] + keep_seq + result[start_pos + original_len:]
         
-        # 清理可能的重复标点或字符
-        # 例如：好的好的的 -> 好的好的
         cleaned = []
         i = 0
         n = len(result)
         while i < n:
-            # 检查是否有连续重复的字符
             if i + 2 < n and result[i] == result[i+1] == result[i+2]:
-                # 连续3个相同字符，只保留2个
                 cleaned.append(result[i])
-                cleaned.append(result[i+1])
                 i += 3
             else:
                 cleaned.append(result[i])
@@ -583,38 +137,34 @@ class LlamaCppTranslator:
         
         return ''.join(cleaned)
 
-    def preprocess_text(self, text, keep_count=2):
+    def preprocess_text(self, text, keep_count=1):
         """预处理文本，压缩重复字符序列
-        
         对于包含重复字符的文本（如"ああああ..."、"うんうんうん..."），进行压缩处理
-        将重复序列缩减为仅保留指定数量（默认2个）
+        将重复序列缩减为仅保留指定数量（默认1个）
         避免占用过多 token 导致其他文本无法翻译
-        
-        Args:
-            text: 原始文本
-            keep_count: 保留的重复次数（默认保留2个）
-        
-        Returns:
-            压缩后的文本
         """
         if not text:
             return text
-        
-        # 使用重复字符压缩功能
-        return self._compress_repeated_sequences(text, keep_count)
+        # 移除所有空格（包括普通空格、制表符等）
+        text = text.replace(' ', '')
+        text = text.replace('\t', '')
+        text = text.replace('\n', '')
+        text = text.replace('\r', '')
+        # 移除所有标点符号
+        # 定义需要移除的标点符号列表（包含中英文、日语等所有语言的标点）
+        punctuation = "。，！？；：\"'（）《》【】…——.,!?:;\"'()<>[]...--「」、！？；：""''（）《》【】…——～～～``''“”‘’〝〞〔〕々〃☆★○●◎◇◆□■△▲▽▼※〓♠♥♦♣♂♀♪♫€¥£¢‰№↑↓←→↘↙Ψ※㊣々♀♂∞①ㄨ≡╬"  
+        # 逐个移除标点符号
+        for char in punctuation:
+            text = text.replace(char, '')
+        return self.compress_repeated_sequences(text, keep_count)
 
-    def translate_multi(self, texts, source_lang="en", target_lang="zh", context_size=20000):
-        """批量翻译多个文本 - 使用单次调用模式"""
-        if not texts:
-            return []
-        
-        # 直接使用单次调用模式，避免Windows上的进程通信问题
-        return self._translate_multi_fallback(texts, source_lang, target_lang, context_size)
+    def translate(self, text, source_lang="en", target_lang="zh", context_size=20000):
+        """翻译单个文本"""
+        # 直接调用批量翻译的回退方法
+        return self._translate_multi_fallback([text], source_lang, target_lang, context_size)[0]
 
-    def _translate_multi_fallback(self, texts, source_lang="en", target_lang="zh", context_size=20000):
-        """使用单次调用模式进行翻译（回退方案）"""
-        import tempfile
-        
+    def _translate_multi_fallback(self, texts, source_lang="en", target_lang="zh", context_size=20000, contexts=None):
+        """使用单次调用模式进行翻译"""
         # 预处理文本，截断超长重复内容
         processed_texts = [self.preprocess_text(text) for text in texts]
         
@@ -640,37 +190,59 @@ class LlamaCppTranslator:
         target_lang_name = lang_map.get(target_lang, target_lang)
 
         if len(processed_texts) == 1:
-            # 单条翻译提示词，与批量翻译保持一致的构建方式
-            prompt_lines = [f"<|startoftext|>Translate this {source_lang_name} text to {target_lang_name}:"]
-            prompt_lines.append(processed_texts[0])
-            prompt_lines.append("")
-            prompt_lines.append("Instructions:")
-            prompt_lines.append("1. Translate the text completely")
-            prompt_lines.append("2. Even if it's very short or just one character, translate it")
-            prompt_lines.append("3. Include all punctuation and special characters")
-            prompt_lines.append("4. Provide the FULL translation, not partial")
-            prompt_lines.append("5. Maintain the original structure")
-            prompt_lines.append("")
-            prompt_lines.append("Translation:")
-            prompt_lines.append("<|extra_0|>")
+            # 单条翻译提示词 - 明确要求只输出翻译
+            text_length = len(processed_texts[0])
+            if contexts and contexts[0]:
+                if text_length <= 5:
+                    # 短文本的特殊提示词
+                    prompt_lines = [f"<|startoftext|>Translate to {target_lang_name}, considering the context:",
+                                   f"Context: {contexts[0]}",
+                                   f"Text to translate: {processed_texts[0]}",
+                                   "Output only the translation, nothing else.",
+                                   f"IMPORTANT: Even if the text is very short (like interjections, onomatopoeia, or single words),",
+                                   f"provide a proper translation in {target_lang_name}.",
+                                   "Do not leave it untranslated or output the original text.",
+                                   "<|extra_0|>"]
+                else:
+                    # 长文本的常规提示词
+                    prompt_lines = [f"<|startoftext|>Translate to {target_lang_name}, considering the context:",
+                                   f"Context: {contexts[0]}",
+                                   f"Text to translate: {processed_texts[0]}",
+                                   "Output only the translation, nothing else.",
+                                   f"For short texts and sound words, provide appropriate translations in {target_lang_name}.",
+                                   "<|extra_0|>"]
+            else:
+                if text_length <= 5:
+                    # 短文本的特殊提示词
+                    prompt_lines = [f"<|startoftext|>Translate to {target_lang_name}: {processed_texts[0]}",
+                                   "Output only the translation, nothing else.",
+                                   f"IMPORTANT: Even if the text is very short (like interjections, onomatopoeia, or single words),",
+                                   f"provide a proper translation in {target_lang_name}.",
+                                   "Do not leave it untranslated or output the original text.",
+                                   "<|extra_0|>"]
+                else:
+                    # 长文本的常规提示词
+                    prompt_lines = [f"<|startoftext|>Translate to {target_lang_name}: {processed_texts[0]}",
+                                   "Output only the translation, nothing else.",
+                                   f"For short texts and sound words, provide appropriate translations in {target_lang_name}.",
+                                   "<|extra_0|>"]
             prompt = "\n".join(prompt_lines)
         else:
-            # 优化提示词，简洁明确
+            # 批量翻译提示词 - 明确要求只输出翻译列表
             num_texts = len(processed_texts)
-            prompt_lines = [f"<|startoftext|>Translate these {num_texts} {source_lang_name} texts to {target_lang_name}."]
-            prompt_lines.append("")
-            prompt_lines.append("Instructions:")
-            prompt_lines.append(f"1. Provide {num_texts} translations, one per input")
-            prompt_lines.append(f"2. Number translations 1 to {num_texts}")
-            prompt_lines.append("3. Do not skip any number")
-            prompt_lines.append("4. Translate every text, no matter how short")
-            prompt_lines.append("5. Keep the same order as input")
-            prompt_lines.append("")
-            prompt_lines.append("Input:")
-            for i, text in enumerate(processed_texts, 1):
-                prompt_lines.append(f"{i}. {text}")
-            prompt_lines.append("")
-            prompt_lines.append("Translations:")
+            prompt_lines = [f"<|startoftext|>Translate the following {num_texts} lines to {target_lang_name}.",
+                           "Consider the context for each line if provided.",
+                           "Output ONLY the translations in numbered list format, nothing else.",
+                           "Do not include any explanations."]
+            
+            for i, (text, context) in enumerate(zip(processed_texts, contexts or [None]*len(texts)), 1):
+                if context:
+                    prompt_lines.append(f"{i}. Context: {context}")
+                    prompt_lines.append(f"   Text: {text}")
+                else:
+                    prompt_lines.append(f"{i}. {text}")
+            
+            prompt_lines.append("<|extra_0|>")
             prompt = "\n".join(prompt_lines)
 
         # 打印输入模型的文本
@@ -679,58 +251,27 @@ class LlamaCppTranslator:
         print("[模型输入结束]")
 
         try:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
-                prompt_file = f.name
-                f.write(prompt)
-            
-            # 从配置获取翻译参数
             from config import config
             temperature = config.get('translation_temperature', 0.05)
             top_k = config.get('translation_top_k', 40)
             top_p = config.get('translation_top_p', 0.95)
             repetition_penalty = config.get('translation_repetition_penalty', 1.0)
-            presence_penalty = config.get('translation_presence_penalty', 0.0)
-            frequency_penalty = config.get('translation_frequency_penalty', 0.0)
-            min_p = config.get('translation_min_p', 0.05)
             
-            cmd = [
-                self.llama_cli_path,
-                "-m", self.model_path,
-                "-f", prompt_file,
-                "-n", "-1",
-                "-t", "8",
-                "-c", str(context_size),
-                "--temp", str(temperature),
-                "--top-p", str(top_p),
-                "--top-k", str(top_k),
-                "--min-p", str(min_p),
-                "--repeat-penalty", str(repetition_penalty),
-                "--presence-penalty", str(presence_penalty),
-                "--frequency-penalty", str(frequency_penalty),
-                "-ngl", "99",
-                "--no-display-prompt",
-                "--simple-io",
-                "-no-cnv",
-            ]
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='ignore',
+            self.server_manager.ensure_server_running()
+            output = self.server_manager.send_request(
+                prompt,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repeat_penalty=repetition_penalty,
+                n_predict=-1,
                 timeout=300
             )
+            
+            if output is None:
+                raise RuntimeError("llama-server 请求返回为空")
 
-            try:
-                os.unlink(prompt_file)
-            except:
-                pass
-
-            if result.returncode != 0:
-                raise RuntimeError(f"llama-cli 运行失败: {result.stderr}")
-
-            output = result.stdout.strip()
+            output = output.strip()
             
             # 打印模型输出的原始文本
             timestamp_print("[模型输出] 翻译模型的原始输出:")
@@ -747,87 +288,181 @@ class LlamaCppTranslator:
             
             if len(texts) == 1:
                 translation = output.strip()
+                # 过滤掉提示词相关内容
+                skip_patterns = [
+                    "instructions", "使用说明", "完整翻译",
+                    "保留所有", "提供完整", "结构不变",
+                    "punctuation", "标点符号", "special characters",
+                    "even if it", "no matter how short",
+                    "context:", "上下文:", "previous:", "next:", "上文:", "下文:"
+                ]
+                lower_trans = translation.lower()
+                for skip in skip_patterns:
+                    if skip.lower() in lower_trans and len(translation) > 100:
+                        timestamp_print(f"[翻译诊断] 输出包含提示词 '{skip}'，返回原文")
+                        translation = texts[0]
+                        break
+                # 提取纯翻译内容，去除上下文标记
+                # 查找 "Text: " 或 "文本：" 标记
+                text_markers = ["Text: ", "text: ", "文本：", "文本:"]
+                for marker in text_markers:
+                    if marker in translation:
+                        translation = translation.split(marker)[-1].strip()
+                        break
                 translation = " ".join(translation.split())
                 return [translation]
             else:
                 # 解析带编号的翻译结果
-                import re
                 lines = [line.strip() for line in output.split('\n') if line.strip()]
                 translations = []
-                
+
                 # 首先尝试按编号解析 (如 "1. 翻译内容" 或 "1) 翻译内容")
                 numbered_trans = {}
                 # 同时收集所有非编号行，用于回退解析
                 non_numbered_lines = []
-                
+
                 for line in lines:
-                    # 匹配编号格式：数字 + 标点 + 空格
-                    match = re.match(r'^(\d+)[\.\)\:\]]\s*(.+)$', line)
+                    # 匹配编号格式：数字 + 标点 + 空格（编号必须是独立的）
+                    # 支持: 1. 内容, 1) 内容, 1: 内容, 1] 内容, 15"内容
+                    match = re.match(r'^(\d+)[.\)\:\]]\s*["\']?\s*(.+)$', line)
                     if match:
                         id_num = int(match.group(1))
                         content = match.group(2).strip()
+                        # 移除末尾可能残留的引号
+                        content = re.sub(r'["\']+$', '', content).strip()
+                        
+                        # 提取纯翻译内容，去除上下文标记
+                        # 1. 首先查找 "Text: " 或 "文本：" 标记
+                        text_markers = ["Text: ", "text: ", "文本：", "文本:"]
+                        text_found = False
+                        for marker in text_markers:
+                            if marker in content:
+                                content = content.split(marker)[-1].strip()
+                                text_found = True
+                                break
+                        
+                        # 2. 如果没有找到文本标记，尝试直接提取翻译内容
+                        if not text_found:
+                            # 去除上下文相关标记
+                            context_markers = ["Context:", "context:", "Previous:", "previous:", "Next:", "next:", "上文:", "下文:"]
+                            # 清理所有上下文标记
+                            for marker in context_markers:
+                                # 移除包含标记的部分
+                                parts = content.split(marker)
+                                # 只保留不包含标记的部分
+                                clean_parts = []
+                                for part in parts:
+                                    # 检查该部分是否包含其他上下文标记
+                                    has_marker = False
+                                    for m in context_markers:
+                                        if m in part:
+                                            has_marker = True
+                                            break
+                                    if not has_marker:
+                                        clean_parts.append(part)
+                                content = " ".join(clean_parts).strip()
+                        
+                        # 3. 进一步清理，去除可能的标记残留
+                        # 处理多行格式，提取纯翻译内容
+                        lines = content.split('\n')
+                        clean_lines = []
+                        for line in lines:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            # 跳过上下文标记行
+                            if any(marker in line for marker in ["Context:", "context:", "Previous:", "previous:", "Next:", "next:", "上文:", "下文:"]):
+                                continue
+                            # 提取文本标记后的内容
+                            if "文本：" in line:
+                                line = line.split("文本：")[-1].strip()
+                            if "Text:" in line:
+                                line = line.split("Text:")[-1].strip()
+                            # 清理可能的残留标记
+                            line = re.sub(r'^(Context|context|Previous|previous|Next|next|上文|下文|Text|text|文本):\s*', '', line)
+                            line = re.sub(r'\s*(Context|context|Previous|previous|Next|next|上文|下文|Text|text|文本):.*$', '', line)
+                            if line:
+                                clean_lines.append(line)
+                        content = " ".join(clean_lines)
+                        # 4. 清理多余的空白字符
+                        content = " ".join(content.split())
+                        
+                        # 4. 清理多余的空白字符
+                        content = " ".join(content.split())
+                        
                         if content:
-                            numbered_trans[id_num] = " ".join(content.split())
+                            numbered_trans[id_num] = content
                     else:
                         # 收集非编号行
                         lower_line = line.lower()
-                        if not any(skip in lower_line for skip in ["translate", "translations", "input"]):
+                        # 过滤掉提示词相关的内容（中英文）
+                        skip_patterns = [
+                            "translate", "translations", "input",
+                            "instructions", "使用说明", "完整翻译",
+                            "保留所有", "提供完整", "结构不变",
+                            "punctuation", "标点符号", "special characters"
+                        ]
+                        if not any(skip in lower_line for skip in skip_patterns):
                             cleaned = line.strip()
                             if cleaned:
                                 non_numbered_lines.append(cleaned)
-                
+
                 # 按顺序提取翻译
                 for i in range(1, len(texts) + 1):
                     if i in numbered_trans:
                         translations.append(numbered_trans[i])
                     else:
                         translations.append(None)
-                
+
                 # 如果编号解析缺失，尝试使用非编号行填充
                 if None in translations and non_numbered_lines:
-                    timestamp_print(f"[llama.cpp翻译诊断] 尝试使用非编号行填充缺失的翻译")
+                    timestamp_print(f"[llama-server翻译诊断] 尝试使用非编号行填充缺失的翻译")
                     line_idx = 0
                     for i in range(len(translations)):
                         if translations[i] is None and line_idx < len(non_numbered_lines):
                             translations[i] = non_numbered_lines[line_idx]
                             line_idx += 1
-                
+
                 # 诊断信息：显示解析结果
-                timestamp_print(f"[llama.cpp翻译诊断] 输入片段数: {len(texts)}, 解析到翻译数: {len([t for t in translations if t is not None])}")
-                timestamp_print(f"[llama.cpp翻译诊断] 模型输出行数: {len(lines)}")
-                
+                timestamp_print(f"[llama-server翻译诊断] 输入片段数: {len(texts)}, 解析到翻译数: {len([t for t in translations if t is not None])}")
+                timestamp_print(f"[llama-server翻译诊断] 模型输出行数: {len(lines)}")
+
                 # 如果编号解析缺失太多，尝试直接按行解析
                 missing_count = translations.count(None)
                 if missing_count > len(texts) * 0.3:  # 缺失超过30%
-                    timestamp_print(f"[llama.cpp翻译] 编号解析缺失 {missing_count} 个，尝试直接按行解析")
-                    timestamp_print(f"[llama.cpp翻译诊断] 前5行输出: {lines[:5]}")
+                    timestamp_print(f"[llama-server翻译] 编号解析缺失 {missing_count} 个，尝试直接按行解析")
+                    timestamp_print(f"[llama-server翻译诊断] 前5行输出: {lines[:5]}")
                     translations = []
                     for line in lines:
                         lower_line = line.lower()
-                        # 跳过提示词
-                        if any(skip in lower_line for skip in ["translate", "translations"]):
+                        # 跳过提示词（中英文）
+                        skip_patterns = [
+                            "translate", "translations", "input", "instructions",
+                            "使用说明", "完整翻译", "保留所有", "提供完整", "结构不变"
+                        ]
+                        if any(skip in lower_line for skip in skip_patterns):
                             continue
-                        # 移除编号前缀
+                        # 只移除独立的编号前缀（数字 + 标点 + 空格）
                         cleaned = re.sub(r'^\d+[\.\)\:\]]\s*', '', line).strip()
                         if cleaned:
                             translations.append(" ".join(cleaned.split()))
-                    timestamp_print(f"[llama.cpp翻译诊断] 按行解析后得到 {len(translations)} 个翻译")
+                    timestamp_print(f"[llama-server翻译诊断] 按行解析后得到 {len(translations)} 个翻译")
                 
                 # 填充缺失的翻译，并记录哪些使用了原文
                 filled_count = 0
                 for i in range(len(translations)):
                     if translations[i] is None:
-                        timestamp_print(f"[llama.cpp翻译诊断] 片段 {i+1} 使用原文填充: {texts[i][:30]}...")
+                        timestamp_print(f"[llama-server翻译诊断] 片段 {i+1} 使用原文填充: {texts[i][:30]}...")
                         translations[i] = texts[i]
                         filled_count += 1
                 
                 if filled_count > 0:
-                    timestamp_print(f"[llama.cpp翻译诊断] 共 {filled_count} 个片段使用原文填充")
+                    timestamp_print(f"[llama-server翻译诊断] 共 {filled_count} 个片段使用原文填充")
                 
                 # 确保数量正确
                 while len(translations) < len(texts):
                     idx = len(translations)
-                    timestamp_print(f"[llama.cpp翻译诊断] 片段 {idx+1} 缺失，使用原文: {texts[idx][:30]}...")
+                    timestamp_print(f"[llama-server翻译诊断] 片段 {idx+1} 缺失，使用原文: {texts[idx][:30]}...")
                     translations.append(texts[idx])
                 
                 if len(translations) > len(texts):
@@ -835,419 +470,577 @@ class LlamaCppTranslator:
                 
                 return translations
 
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("llama-cli 翻译超时")
         except Exception as e:
-            raise RuntimeError(f"llama-cli 翻译失败: {str(e)}")
+            raise RuntimeError(f"llama-server 翻译失败: {str(e)}")
 
-    def estimate_tokens(self, text, language="en"):
-        """估算文本的 token 数量
-        
-        根据不同语言使用不同的换算比例
-        """
-        if not text:
-            return 0
-        
-        # 语言到换算比例的映射
-        char_per_token = {
-            "zh": 1.00,    # 中文
-            "zh-Hant": 1.00, # 繁体中文
-            "yue": 1.00,    # 粤语
-            "ja": 1.5,     # 日语（调整为更准确的比例）
-            "ko": 2.0,     # 韩语（调整为更准确的比例）
-            "en": 4.23,    # 英文
-            "fr": 3.69,    # 法语
-            "pt": 4.36,    # 葡萄牙语
-            "es": 4.45,    # 西班牙语
-            "tr": 4.23,    # 土耳其语
-            "ru": 3.36,    # 俄语
-            "ar": 3.80,    # 阿拉伯语
-            "th": 4.73,    # 泰语
-            "it": 4.18,    # 意大利语
-            "de": 4.80,    # 德语
-            "vi": 4.64,    # 越南语
-            "ms": 5.44,    # 马来语
-            "id": 4.90,    # 印尼语
-            "tl": 4.23,    # 菲律宾语
-            "hi": 3.23,    # 印地语
-            "pl": 4.46,    # 波兰语
-            "cs": 4.73,    # 捷克语
-            "nl": 4.80,    # 荷兰语
-            "km": 5.44,    # 高棉语
-            "my": 4.23,    # 缅甸语
-            "fa": 3.80,    # 波斯语
-            "gu": 4.73,    # 古吉拉特语
-            "ur": 3.23,    # 乌尔都语
-            "te": 3.23,    # 泰卢固语
-            "mr": 4.73,    # 马拉地语
-            "he": 3.23,    # 希伯来语
-            "bn": 3.23,    # 孟加拉语
-            "ta": 3.23,    # 泰米尔语
-            "uk": 4.73,    # 乌克兰语
-            "bo": 3.80,    # 藏语
-            "kk": 3.23,    # 哈萨克语
-            "mn": 3.23,    # 蒙古语
-            "ug": 3.80     # 维吾尔语
-        }
-        
-        # 获取对应语言的换算比例
-        ratio = char_per_token.get(language, 4.0)  # 默认值
-        
-        # 计算token数
-        return int(len(text) / ratio) + 1
-    
-    def calculate_batch_tokens(self, texts, source_lang="en", target_lang="zh"):
-        """计算批次所需的 token 数量
-        
-        包括：
-        1. 提示词本身的 token
-        2. 所有输入文本的 token
-        3. 预期输出的 token（每个文本的翻译）
-        4. 编号格式和换行的开销
-        """
-        if not texts:
-            return 0
-        
-        # 计算预处理后的文本长度
-        processed_texts = [self.preprocess_text(text) for text in texts]
-        
-        # 提示词开销计算（根据实际提示词长度估算）
-        num_texts = len(texts)
-        source_lang_name = {"zh": "Chinese", "en": "English", "ja": "Japanese", "ko": "Korean"}.get(source_lang, source_lang)
-        target_lang_name = {"zh": "Chinese", "en": "English", "ja": "Japanese", "ko": "Korean"}.get(target_lang, target_lang)
-        
-        # 构建实际提示词以更准确估算
-        prompt_lines = [f"Translate the following {num_texts} {source_lang_name} texts to {target_lang_name}:"]
-        prompt_lines.append("")
-        for i, text in enumerate(processed_texts, 1):
-            prompt_lines.append(f"{i}. {text}")
-        prompt_lines.append("")
-        prompt_lines.append(f"CRITICAL INSTRUCTION: You must provide exactly {num_texts} translations, one for each input text, in the same order.")
-        prompt_lines.append("YOU MUST translate EVERY text, including short single characters and phrases.")
-        prompt_lines.append("YOU MUST number each translation to match the input numbering exactly.")
-        prompt_lines.append("YOU MUST NOT skip any translations, even for short or single-character inputs.")
-        prompt_lines.append("YOU MUST continue until ALL translations are provided, including the last one.")
-        prompt_lines.append("FAILURE TO PROVIDE ALL TRANSLATIONS WILL RESULT IN AN INCOMPLETE RESPONSE.")
-        
-        # 计算提示词token数
-        prompt_text = "\n".join(prompt_lines)
-        prompt_tokens = self.estimate_tokens(prompt_text, source_lang)
-        
-        # 输入文本的 tokens
-        input_tokens = sum(self.estimate_tokens(text, source_lang) for text in processed_texts)
-        
-        # 预期输出的 tokens（翻译通常和原文长度相近或略短）
-        output_tokens = sum(self.estimate_tokens(text, target_lang) for text in processed_texts)
-        
-        # 格式开销（每个片段的编号和换行）
-        format_overhead = len(texts) * 3  # 每个片段约3个token的格式开销
-        
-        total_tokens = prompt_tokens + input_tokens + output_tokens + format_overhead
-        return total_tokens
-    
-    def split_into_smart_batches(self, segments, max_tokens_per_batch=6000, max_batch_size=32, max_output_tokens=8000, source_lang="en", target_lang="zh"):
-        """智能分割批次，确保不超出 token 限制和最大输出限制
-        
-        Args:
-            segments: 所有片段列表
-            max_tokens_per_batch: 每批最大 token 数（留一些余量给上下文）
-            max_batch_size: 每批最大片段数（防止批次过大）
-            max_output_tokens: 最大输出 token 数（llama.cpp 限制）
-            source_lang: 源语言代码
-            target_lang: 目标语言代码
-        
-        Returns:
-            批次列表，每个批次是一个片段列表
-        """
-        batches = []
-        current_batch = []
-        current_batch_tokens = 0
-        
-        # 安全余量（预留10%的token空间）
-        safety_margin = 0.9
-        adjusted_max_tokens = int(max_tokens_per_batch * safety_margin)
-        adjusted_max_output = int(max_output_tokens * safety_margin)
-        
-        for segment in segments:
-            text = segment["text"]
-            text_tokens = self.estimate_tokens(text, source_lang)
-            
-            # 检查加入这个片段是否会超出限制
-            # 预估加入后的总 token 数
-            projected_tokens = self.calculate_batch_tokens(
-                [s["text"] for s in current_batch] + [text],
-                source_lang, target_lang
-            )
-            
-            # 预估输出 token 数（翻译输出）
-            projected_output_tokens = sum(
-                self.estimate_tokens(self.preprocess_text(s["text"]), target_lang) 
-                for s in current_batch + [segment]
-            ) + len(current_batch + [segment]) * 10  # 加上编号和格式开销
-            
-            # 检查是否超出限制
-            batch_full = False
-            
-            # 检查token限制
-            if projected_tokens > adjusted_max_tokens:
-                batch_full = True
-            
-            # 检查输出token限制
-            if projected_output_tokens > adjusted_max_output:
-                batch_full = True
-            
-            # 检查批次大小限制
-            if len(current_batch) >= max_batch_size:
-                batch_full = True
-            
-            # 如果当前批次已满，创建新批次
-            if batch_full:
-                if current_batch:  # 保存当前批次
-                    batches.append(current_batch)
-                    batch_texts = [s["text"] for s in current_batch]
-                    total_tokens = self.calculate_batch_tokens(batch_texts, source_lang, target_lang)
-                    input_tokens = sum(self.estimate_tokens(self.preprocess_text(text), source_lang) for text in batch_texts)
-                    actual_output = sum(self.estimate_tokens(self.preprocess_text(s["text"]), target_lang) for s in current_batch)
-                    timestamp_print(f"[智能分批] 创建批次 {len(batches)}: {len(current_batch)} 个片段, "
-                                  f"总token数 {total_tokens} (输入 {input_tokens} + 输出 {actual_output} + 开销)")
-                
-                # 开始新批次
-                current_batch = [segment]
-                current_batch_tokens = text_tokens
-            else:
-                # 加入当前批次
-                current_batch.append(segment)
-                current_batch_tokens += text_tokens
-        
-        # 保存最后一个批次
-        if current_batch:
-            batches.append(current_batch)
-            batch_texts = [s["text"] for s in current_batch]
-            total_tokens = self.calculate_batch_tokens(batch_texts, source_lang, target_lang)
-            input_tokens = sum(self.estimate_tokens(self.preprocess_text(text), source_lang) for text in batch_texts)
-            actual_output = sum(self.estimate_tokens(self.preprocess_text(s["text"]), target_lang) for s in current_batch)
-            timestamp_print(f"[智能分批] 创建批次 {len(batches)}: {len(current_batch)} 个片段, "
-                          f"总token数 {total_tokens} (输入 {input_tokens} + 输出 {actual_output} + 开销)")
-        
-        return batches
+
+
+
+
+
 
     def translate_batch(self, segments, source_lang="en", target_lang="zh", progress_callback=None, batch_size=None, context_size=2048, max_output_tokens=8000):
-        """批量翻译 - 使用智能分批确保不超出上下文限制和输出限制"""
         from config import config
         
-        # 从配置获取token限制（如果未指定）
-        if batch_size is None:
-            batch_size = config.get('translation_batch_size', 4096)
+        # 相似度计算缓存
+        similarity_cache = {}
         
-        total_segments_segments = len(segments)
-        timestamp_print(f"[llama.cpp翻译] 开始批量翻译，共 {total_segments_segments} 个片段")
-        timestamp_print(f"[llama.cpp翻译] 上下文大小: {context_size}, 最大输出: {max_output_tokens} tokens")
-        timestamp_print(f"[llama.cpp翻译] 每批最大token数: {batch_size}")
-        
-        # 使用智能分批算法
-        # 使用配置的token限制作为每批的最大token数
-        max_tokens_per_batch = batch_size
-        # 最大批次大小限制
-        max_batch_size = 32
-        batches = self.split_into_smart_batches(segments, max_tokens_per_batch, max_batch_size, max_output_tokens, source_lang, target_lang)
-        
-        timestamp_print(f"[llama.cpp翻译] 智能分批完成，共 {len(batches)} 个批次")
-        
-        # 处理每个批次
-        processed_count = 0
-        for batch_num, batch in enumerate(batches, 1):
-            timestamp_print(f"[llama.cpp翻译] 处理第 {batch_num}/{len(batches)} 批，包含 {len(batch)} 个片段")
-            
-            # 提取该批次的所有原文
-            texts = [segment["text"] for segment in batch]
-            
-            # 直接调用 _translate_batch_with_retry 方法，处理未翻译的片段
-            try:
-                translations = self._translate_batch_with_retry(
-                    batch, texts, source_lang, target_lang, context_size, max_output_tokens
-                )
+        def calc_similarity(text1, text2):
+            # 生成缓存键
+            cache_key = (text1, text2)
+            if cache_key in similarity_cache:
+                return similarity_cache[cache_key]
                 
-                # 将翻译结果赋值给对应的片段
-                for i, (segment, translated) in enumerate(zip(batch, translations)):
-                    segment["translated"] = translated
-            except Exception as e:
-                timestamp_print(f"[llama.cpp翻译] 翻译失败，尝试逐条翻译: {str(e)}")
-                # 批量失败时，逐条翻译
-                for i, segment in enumerate(batch):
-                    original_text = segment["text"]
-                    try:
-                        translated_text = self.translate(original_text, source_lang, target_lang, context_size)
-                        segment["translated"] = translated_text
-                    except Exception as e2:
-                        timestamp_print(f"[llama.cpp翻译] 翻译失败: {str(e2)}")
-                        segment["translated"] = original_text
+            if not text1 or not text2:
+                result = 0.0
+                similarity_cache[cache_key] = result
+                return result
             
-            # 更新处理计数
-            for segment in batch:
-                processed_count += 1
-                if progress_callback and total_segments_segments > 0:
-                    progress_callback(int(processed_count / total_segments_segments * 100))
+            # 早期退出：长度差异过大
+            len1 = len(text1)
+            len2 = len(text2)
+            if max(len1, len2) > min(len1, len2) * 3:
+                # 长度差异超过3倍，相似度肯定很低
+                result = 0.1
+                similarity_cache[cache_key] = result
+                return result
             
-            # 计算实际tokens（使用与预估值相同的预处理）
-            actual_input_tokens = sum(self.estimate_tokens(self.preprocess_text(segment["text"])) for segment in batch)
-            actual_output_tokens = sum(self.estimate_tokens(self.preprocess_text(segment.get("translated", segment["text"]))) for segment in batch)
+            # 早期退出：完全相同
+            if text1 == text2:
+                result = 1.0
+                similarity_cache[cache_key] = result
+                return result
             
-            # 批量打印这一批的翻译结果
-            batch_start_idx = processed_count - len(batch) + 1
-            batch_end_idx = processed_count
-            timestamp_print(f"[翻译批次 {batch_num}/{len(batches)}] 完成 {batch_start_idx}-{batch_end_idx}/{total_segments_segments}:")
-            timestamp_print(f"  [Tokens] 实际输入: {actual_input_tokens}, 实际输出: {actual_output_tokens}")
-            for i, segment in enumerate(batch):
-                global_idx = batch_start_idx + i
-                original = segment["text"]
-                translated = segment.get("translated") or original
-                # 截断过长的文本以便显示
-                orig_display = original[:50] + "..." if len(original) > 50 else original
-                trans_display = translated[:50] + "..." if len(translated) > 50 else translated
-                print(f"  [{global_idx}/{total_segments_segments}] {orig_display} -> {trans_display}")
-        
-        timestamp_print(f"[llama.cpp翻译] 批量翻译完成，共翻译 {total_segments_segments} 个片段")
-        return segments
-
-    def _calculate_similarity(self, text1, text2):
-        """计算两个文本的相似度（简单实现）"""
-        if not text1 or not text2:
-            return 0.0
-        
-        # 预处理：去除空格和标点，转为小写
-        import re
-        def normalize(text):
-            text = re.sub(r'\s+', '', text.lower())
-            text = re.sub(r'[^\w\u4e00-\u9fff]', '', text)  # 保留字母数字和中文
-            return text
-        
-        norm1 = normalize(text1)
-        norm2 = normalize(text2)
-        
-        if not norm1 or not norm2:
-            return 0.0
-        
-        # 计算编辑距离相似度
-        from difflib import SequenceMatcher
-        similarity = SequenceMatcher(None, norm1, norm2).ratio()
-        return similarity
-
-    def _translate_batch_with_retry(self, batch, texts, source_lang, target_lang, context_size, max_output_tokens, retry_count=0):
-        """翻译批次，对未翻译片段进行单条翻译"""
-        max_retries = 3
-        
-        try:
-            # 使用批量翻译
-            translations = self.translate_multi(texts, source_lang, target_lang, context_size)
-            
-            # 检测翻译质量，记录未翻译的片段索引
-            untranslated_indices = []
-            for i, (orig, trans) in enumerate(zip(texts, translations)):
-                similarity = self._calculate_similarity(orig, trans)
-                # 根据文本长度调整相似度阈值
-                text_length = len(orig)
-                if text_length <= 2:
-                    # 单个字符或两个字符，即使相似度高也视为已翻译
-                    # 因为很多日文中的单字在中文中是相同的
-                    threshold = 1.01  # 设置一个大于1的值，确保不会被视为未翻译
-                elif text_length <= 5:
-                    # 短文本，相似度阈值设为0.7
-                    threshold = 0.7
+            def detect_language(text):
+                """简单的语言检测
+                
+                Args:
+                    text: 待检测的文本
+                    
+                Returns:
+                    语言代码 ('ja' for Japanese, 'zh' for Chinese, 'en' for English, 'other' for others)
+                """
+                import re
+                # 检测中文字符
+                if re.search(r'[\u4e00-\u9fff]', text):
+                    return 'zh'
+                # 检测日文字符
+                elif re.search(r'[\u3040-\u30ff]', text):
+                    return 'ja'
+                # 检测英文字符
+                elif re.search(r'[a-zA-Z]', text):
+                    return 'en'
                 else:
-                    # 普通文本，相似度阈值设为0.8
-                    threshold = 0.8
-                timestamp_print(f"[llama.cpp翻译] 片段 {i+1} 相似度: {similarity}, 阈值: {threshold}, 原文: {orig[:20]}..., 译文: {trans[:20]}...")
-                if similarity > threshold:
-                    untranslated_indices.append(i)
+                    return 'other'
             
-            # 处理未翻译的片段（只对未翻译的片段进行单条翻译）
-            timestamp_print(f"[llama.cpp翻译] 未翻译片段索引: {untranslated_indices}")
-            if untranslated_indices:
-                timestamp_print(f"[llama.cpp翻译] 检测到 {len(untranslated_indices)} 个未翻译片段，只对这些片段进行单条翻译")
+            def normalize(text, lang=None):
+                """增强的归一化函数，支持多语言
                 
-                for idx in untranslated_indices:
-                    text = texts[idx]
-                    timestamp_print(f"[llama.cpp翻译] 单条翻译未翻译片段: {text[:30]}...")
+                Args:
+                    text: 待归一化的文本
+                    lang: 语言代码
+                    
+                Returns:
+                    归一化后的文本
+                """
+                import re
+                # 转换为小写
+                text = text.lower()
+                # 移除多余空格
+                text = re.sub(r'\s+', ' ', text).strip()
+                
+                # 根据语言进行特殊处理
+                if lang == 'ja':
+                    # 保留日语假名和汉字
+                    text = re.sub(r'[^\w\u3040-\u30ff\u4e00-\u9fff]', '', text)
+                elif lang == 'zh':
+                    # 保留汉字和基本标点
+                    text = re.sub(r'[^\w\u4e00-\u9fff]', '', text)
+                elif lang == 'en':
+                    # 保留英文单词
+                    text = re.sub(r'[^\w]', '', text)
+                else:
+                    # 通用处理
+                    text = re.sub(r'[^\w\u4e00-\u9fff\u3040-\u30ff]', '', text)
+                
+                return text
+            
+            def levenshtein_distance(s1, s2):
+                """计算Levenshtein距离
+                
+                Args:
+                    s1: 字符串1
+                    s2: 字符串2
+                    
+                Returns:
+                    Levenshtein距离
+                """
+                if len(s1) < len(s2):
+                    return levenshtein_distance(s2, s1)
+                if len(s2) == 0:
+                    return len(s1)
+                previous_row = range(len(s2) + 1)
+                for i, c1 in enumerate(s1):
+                    current_row = [i + 1]
+                    for j, c2 in enumerate(s2):
+                        insertions = previous_row[j + 1] + 1
+                        deletions = current_row[j] + 1
+                        substitutions = previous_row[j] + (c1 != c2)
+                        current_row.append(min(insertions, deletions, substitutions))
+                    previous_row = current_row
+                return previous_row[-1]
+            
+            def calculate_levenshtein_similarity(s1, s2):
+                """计算基于Levenshtein距离的相似度
+                
+                Args:
+                    s1: 字符串1
+                    s2: 字符串2
+                    
+                Returns:
+                    相似度分数 (0.0-1.0)
+                """
+                if not s1 or not s2:
+                    return 0.0
+                distance = levenshtein_distance(s1, s2)
+                max_length = max(len(s1), len(s2))
+                if max_length == 0:
+                    return 1.0
+                return 1.0 - (distance / max_length)
+            
+            def calculate_word_similarity(text1, text2, lang1, lang2):
+                """计算词级相似度
+                
+                Args:
+                    text1: 文本1
+                    text2: 文本2
+                    lang1: 文本1的语言
+                    lang2: 文本2的语言
+                    
+                Returns:
+                    词级相似度分数 (0.0-1.0)
+                """
+                import re
+                # 简单的词分割
+                if lang1 == 'zh' or lang2 == 'zh':
+                    # 中文按字符分割
+                    words1 = list(text1)
+                    words2 = list(text2)
+                else:
+                    # 其他语言按空格分割
+                    words1 = re.findall(r'\w+', text1)
+                    words2 = re.findall(r'\w+', text2)
+                
+                if not words1 or not words2:
+                    return 0.0
+                
+                # 计算共同词的比例
+                common_words = set(words1) & set(words2)
+                if not common_words:
+                    return 0.0
+                
+                return len(common_words) / max(len(words1), len(words2))
+            
+            def calculate_length_factor(text1, text2):
+                """计算长度因子，考虑文本长度差异
+                
+                Args:
+                    text1: 文本1
+                    text2: 文本2
+                    
+                Returns:
+                    长度因子 (0.0-1.0)
+                """
+                len1 = len(text1)
+                len2 = len(text2)
+                if len1 == 0 or len2 == 0:
+                    return 0.0
+                
+                # 计算长度比例
+                ratio = min(len1, len2) / max(len1, len2)
+                # 对于短文本，长度差异的影响更大
+                if max(len1, len2) < 10:
+                    return ratio * 0.8 + 0.2
+                else:
+                    return ratio * 0.5 + 0.5
+            
+            # 检测语言
+            lang1 = detect_language(text1)
+            lang2 = detect_language(text2)
+            
+            # 归一化文本
+            norm1 = normalize(text1, lang1)
+            norm2 = normalize(text2, lang2)
+            
+            if not norm1 or not norm2:
+                return 0.0
+            
+            # 计算SequenceMatcher相似度
+            from difflib import SequenceMatcher
+            sequence_similarity = SequenceMatcher(None, norm1, norm2).ratio()
+            
+            # 计算Levenshtein相似度
+            levenshtein_sim = calculate_levenshtein_similarity(norm1, norm2)
+            
+            # 计算词级相似度
+            word_similarity = calculate_word_similarity(norm1, norm2, lang1, lang2)
+            
+            # 计算长度因子
+            length_factor = calculate_length_factor(norm1, norm2)
+            
+            # 加权计算总相似度
+            # 对于短文本，词级相似度权重更高
+            if max(len(norm1), len(norm2)) < 10:
+                # 短文本的特殊权重
+                if max(len(norm1), len(norm2)) <= 5:
+                    # 极短文本（1-5个字符）
+                    total_similarity = (
+                        sequence_similarity * 0.2 +
+                        levenshtein_sim * 0.4 +
+                        word_similarity * 0.3 +
+                        length_factor * 0.1
+                    )
+                else:
+                    # 中等长度文本（6-9个字符）
+                    total_similarity = (
+                        sequence_similarity * 0.3 +
+                        levenshtein_sim * 0.3 +
+                        word_similarity * 0.3 +
+                        length_factor * 0.1
+                    )
+            else:
+                # 长文本的常规权重
+                total_similarity = (
+                    sequence_similarity * 0.4 +
+                    levenshtein_sim * 0.3 +
+                    word_similarity * 0.2 +
+                    length_factor * 0.1
+                )
+            
+            # 缓存结果
+            cache_key = (text1, text2)
+            similarity_cache[cache_key] = total_similarity
+            
+            return total_similarity
+        
+        def extract_context(segments, index, window_size=2):
+            """提取上下文信息
+            
+            Args:
+                segments: 所有片段列表
+                index: 当前片段的索引
+                window_size: 前后上下文的窗口大小
+                
+            Returns:
+                上下文文本
+            """
+            # 对于短文本，不使用上下文，直接翻译
+            current_text = segments[index].get('text', '')
+            if len(current_text) <= 5:
+                return ""
+                
+            context = []
+            # 提取前上下文
+            for i in range(max(0, index - window_size), index):
+                context.append(f"Previous: {segments[i]['text']}")
+            # 提取后上下文
+            for i in range(index + 1, min(len(segments), index + window_size + 1)):
+                context.append(f"Next: {segments[i]['text']}")
+            return " ".join(context)
+        
+        total_segments = len(segments)
+        timestamp_print(f"[llama-server翻译] 开始单条翻译，共 {total_segments} 个片段")
+        timestamp_print(f"[llama-server翻译] 上下文大小: {context_size}, 最大输出: {max_output_tokens} tokens")
+        
+        # 检查是否需要重置会话
+        from config import config
+        reset_session = config.get('translation_reset_session', True)
+        if reset_session:
+            timestamp_print("[llama-server翻译] 重置会话状态，确保全新的翻译环境...")
+            self.server_manager.reset_session()
+        else:
+            # 确保服务器运行
+            self.server_manager.ensure_server_running()
+        
+        processed_count = 0
+        for i, segment in enumerate(segments):
+            text = segment["text"]
+            # 提取上下文信息
+            context = extract_context(segments, i)
+            
+            timestamp_print(f"[llama-server翻译] 处理片段 {i+1}/{total_segments}: {text[:30]}...")
+            
+            max_retries = 3
+            retry_count = 0
+            translation = None
+            
+            while retry_count < max_retries:
+                try:
+                    # 单条翻译，使用上下文
+                    translation = self._translate_multi_fallback([text], source_lang, target_lang, context_size, [context])[0]
+                    
+                    # 检查翻译结果
+                    similarity = calc_similarity(text, translation)
+                    # 计算文本长度
+                    text_length = len(text)
+                    
+                    # 自适应阈值计算
+                    def calculate_adaptive_threshold(text, source_lang, target_lang):
+                        """计算自适应阈值
+                        
+                        Args:
+                            text: 待翻译文本
+                            source_lang: 源语言
+                            target_lang: 目标语言
+                            
+                        Returns:
+                            自适应阈值
+                        """
+                        import re
+                        text_length = len(text)
+                        
+                        # 基础阈值 - 基于文本长度
+                        if text_length <= 2:
+                            base_threshold = 0.9  # 极短文本，允许较高相似度
+                        elif text_length <= 5:
+                            base_threshold = 0.8  # 短文本，阈值较低
+                        else:
+                            base_threshold = 0.8
+                        
+                        # 语言调整因子
+                        lang_factor = 1.0
+                        if source_lang == 'ja' and target_lang == 'zh':
+                            # 日译中，相似度可能较高
+                            lang_factor = 0.9
+                        elif source_lang == 'en' and target_lang == 'zh':
+                            # 英译中，相似度可能较低
+                            lang_factor = 1.1
+                        
+                        # 内容类型调整
+                        content_factor = 1.0
+                        # 检测拟声词
+                        if re.search(r'[\u3040-\u30ff]+[！!]+', text):
+                            content_factor = 0.7  # 拟声词翻译可能与原文相似
+                        # 检测感叹词
+                        elif re.search(r'[！!]+$', text):
+                            content_factor = 0.8
+                        # 检测数字和代码
+                        elif re.search(r'^[0-9a-zA-Z]+$', text):
+                            content_factor = 1.05  # 数字和代码可能需要完全相同
+                        
+                        # 计算最终阈值
+                        final_threshold = base_threshold * lang_factor * content_factor
+                        # 确保阈值在合理范围内
+                        final_threshold = max(0.5, min(1.01, final_threshold))
+                        return final_threshold
+                    
+                    threshold = calculate_adaptive_threshold(text, source_lang, target_lang)
+                    timestamp_print(f"[llama-server翻译] 片段 {i+1} 相似度: {similarity}, 阈值: {threshold}, 原文: {text[:20]}..., 译文: {translation[:20]}...")
+                    
+                    if similarity <= threshold:
+                        # 翻译成功
+                        segment["translated"] = translation
+                        timestamp_print(f"[llama-server翻译] 翻译成功: {translation[:30]}...")
+                    else:
+                        # 翻译失败，使用原文
+                        segment["translated"] = text
+                        timestamp_print(f"[llama-server翻译] 翻译失败，使用原文")
+                    break
+                except Exception as e:
+                    retry_count += 1
+                    timestamp_print(f"[llama-server翻译] 翻译失败，第{retry_count}次重试: {str(e)}")
+                    if retry_count >= max_retries:
+                        # 多次重试失败，使用原文
+                        segment["translated"] = text
+                        timestamp_print(f"[llama-server翻译] 多次重试失败，使用原文")
+            
+            processed_count += 1
+            if progress_callback and total_segments > 0:
+                progress_callback(int(processed_count / total_segments * 100))
+            
+            # 打印翻译结果
+            original = segment["text"]
+            translated = segment.get("translated") or original
+            orig_display = original[:50] + "..." if len(original) > 50 else original
+            trans_display = translated[:50] + "..." if len(translated) > 50 else translated
+            print(f"  [{i+1}/{total_segments}] {orig_display} -> {trans_display}")
+        
+        timestamp_print(f"[llama-server翻译] 单条翻译完成，共翻译 {total_segments} 个片段")
+        print(f"[llama-server翻译] 单条翻译完成，共翻译 {total_segments} 个片段")
+        
+        # 验证翻译结果
+        print(f"[llama-server翻译] 开始验证翻译结果...")
+        timestamp_print(f"[llama-server翻译] 开始验证翻译结果...")
+        
+        # 统计翻译成功和失败的数量
+        success_count = 0
+        fail_count = 0
+        untranslated_indices = []
+        
+        for i, segment in enumerate(segments):
+            original_text = segment["text"]
+            translated_text = segment.get("translated", "")
+            
+            # 使用语言占比检测判断翻译是否成功
+            success, target_ratio, lang_counts = check_translation_success(
+                original_text, translated_text, source_lang, target_lang, threshold=0.5
+            )
+            
+            if success:
+                success_count += 1
+            else:
+                untranslated_indices.append(i)
+                fail_count += 1
+                quality_info = get_translation_quality_info(original_text, translated_text, source_lang, target_lang)
+                print(f"[llama-server翻译] 片段 {i+1} 翻译失败: {quality_info['message']}, 原文={original_text[:30]}...")
+        
+        print(f"[llama-server翻译] 验证完成: 成功 {success_count} 个, 失败 {fail_count} 个")
+        timestamp_print(f"[llama-server翻译] 验证完成: 成功 {success_count} 个, 失败 {fail_count} 个")
+        
+        if untranslated_indices:
+            print(f"[llama-server翻译] 发现 {len(untranslated_indices)} 个片段未翻译或翻译失败，开始重新翻译...")
+            timestamp_print(f"[llama-server翻译] 发现 {len(untranslated_indices)} 个片段未翻译或翻译失败，开始重新翻译...")
+            
+            # 重新翻译直到成功或达到最大重试次数
+            max_total_retries = 10  # 每个片段的最大总重试次数
+            current_retries = {idx: 0 for idx in untranslated_indices}
+            remaining_indices = untranslated_indices.copy()
+            
+            while remaining_indices and max(current_retries.values()) < max_total_retries:
+                current_batch = remaining_indices.copy()
+                remaining_indices = []
+                
+                for idx in current_batch:
+                    segment = segments[idx]
+                    text = segment["text"]
+                    # 对于短文本，不使用上下文，直接翻译
+                    if len(text) <= 5:
+                        context = ""
+                    else:
+                        context = extract_context(segments, idx)
+                    
+                    current_retries[idx] += 1
+                    retry_count = current_retries[idx]
+                    
+                    if retry_count > max_total_retries:
+                        # 达到最大重试次数，使用原文
+                        segment["translated"] = text
+                        print(f"[llama-server翻译] 片段 {idx+1} 达到最大重试次数 {max_total_retries}，使用原文")
+                        timestamp_print(f"[llama-server翻译] 片段 {idx+1} 达到最大重试次数 {max_total_retries}，使用原文")
+                        continue
+                    
+                    print(f"[llama-server翻译] 重新翻译片段 {idx+1}/{total_segments} (第{retry_count}次): {text[:30]}...")
+                    timestamp_print(f"[llama-server翻译] 重新翻译片段 {idx+1}/{total_segments} (第{retry_count}次): {text[:30]}...")
                     
                     try:
-                        # 直接使用逐条翻译，只翻译这个未翻译的片段
-                        text_length = len(text)
-                        timestamp_print(f"[llama.cpp翻译] 开始单条翻译: {text} (长度: {text_length})")
-                        single_translation = self.translate(text, source_lang, target_lang, context_size)
-                        timestamp_print(f"[llama.cpp翻译] 单条翻译结果: {single_translation}")
-                        # 再次检查翻译质量
-                        similarity = self._calculate_similarity(text, single_translation)
-                        # 根据文本长度调整阈值
-                        if text_length <= 2:
-                            threshold = 0.5
-                        elif text_length <= 5:
-                            threshold = 0.7
+                        # 单条翻译，使用上下文
+                        translation = self._translate_multi_fallback([text], source_lang, target_lang, context_size, [context])[0]
+                        
+                        # 检查翻译结果
+                        similarity = calc_similarity(text, translation)
+                        
+                        # 自适应阈值计算
+                        def calculate_adaptive_threshold(text, source_lang, target_lang):
+                            """计算自适应阈值
+                            
+                            Args:
+                                text: 待翻译文本
+                                source_lang: 源语言
+                                target_lang: 目标语言
+                                
+                            Returns:
+                                自适应阈值
+                            """
+                            import re
+                            text_length = len(text)
+                            
+                            # 基础阈值 - 基于文本长度
+                            if text_length <= 2:
+                                base_threshold = 0.9  # 极短文本，允许较高相似度
+                            elif text_length <= 5:
+                                base_threshold = 0.8  # 短文本，阈值较低
+                            else:
+                                base_threshold = 0.8
+                            
+                            # 语言调整因子
+                            lang_factor = 1.0
+                            if source_lang == 'ja' and target_lang == 'zh':
+                                # 日译中，相似度可能较高
+                                lang_factor = 0.9
+                            elif source_lang == 'en' and target_lang == 'zh':
+                                # 英译中，相似度可能较低
+                                lang_factor = 1.1
+                            
+                            # 内容类型调整
+                            content_factor = 1.0
+                            # 检测拟声词
+                            if re.search(r'[\u3040-\u30ff]+[！!]+', text):
+                                content_factor = 0.7  # 拟声词翻译可能与原文相似
+                            # 检测感叹词
+                            elif re.search(r'[！!]+$', text):
+                                content_factor = 0.8
+                            # 检测数字和代码
+                            elif re.search(r'^[0-9a-zA-Z]+$', text):
+                                content_factor = 1.05  # 数字和代码可能需要完全相同
+                            
+                            # 计算最终阈值
+                            final_threshold = base_threshold * lang_factor * content_factor
+                            # 确保阈值在合理范围内
+                            final_threshold = max(0.5, min(1.01, final_threshold))
+                            return final_threshold
+                        
+                        threshold = calculate_adaptive_threshold(text, source_lang, target_lang)
+                        print(f"[llama-server翻译] 片段 {idx+1} 相似度: {similarity}, 阈值: {threshold}, 原文: {text[:20]}..., 译文: {translation[:20]}...")
+                        timestamp_print(f"[llama-server翻译] 片段 {idx+1} 相似度: {similarity}, 阈值: {threshold}, 原文: {text[:20]}..., 译文: {translation[:20]}...")
+                        
+                        # 再次验证翻译结果，使用语言占比检测
+                        success, target_ratio, lang_counts = check_translation_success(
+                            text, translation, source_lang, target_lang, threshold
+                        )
+                        quality_info = get_translation_quality_info(text, translation, source_lang, target_lang)
+                        print(f"[llama-server翻译] 片段 {idx+1} 翻译质量: {quality_info['message']}, 占比: {target_ratio:.2%}, 原文: {text[:20]}..., 译文: {translation[:20]}...")
+                        timestamp_print(f"[llama-server翻译] 片段 {idx+1} 翻译质量: {quality_info['message']}, 占比: {target_ratio:.2%}, 原文: {text[:20]}..., 译文: {translation[:20]}...")
+                        
+                        if success:
+                            # 翻译成功
+                            segment["translated"] = translation
+                            print(f"[llama-server翻译] 重新翻译成功: {translation[:30]}...")
+                            timestamp_print(f"[llama-server翻译] 重新翻译成功: {translation[:30]}...")
                         else:
-                            threshold = 0.8
-                        timestamp_print(f"[llama.cpp翻译] 单条翻译相似度: {similarity}, 阈值: {threshold}")
-                        if similarity <= threshold:
-                            translations[idx] = single_translation
-                            timestamp_print(f"[llama.cpp翻译] 单条翻译成功: {single_translation[:30]}...")
-                        else:
-                            timestamp_print(f"[llama.cpp翻译] 单条翻译仍未成功，使用原文")
+                            # 翻译失败，继续重试
+                            print(f"[llama-server翻译] 重新翻译仍失败，将再次尝试")
+                            timestamp_print(f"[llama-server翻译] 重新翻译仍失败，将再次尝试")
+                            remaining_indices.append(idx)
                     except Exception as e:
-                        timestamp_print(f"[llama.cpp翻译] 单条翻译失败: {str(e)}")
-            else:
-                timestamp_print("[llama.cpp翻译] 没有检测到未翻译的片段")
+                        print(f"[llama-server翻译] 重新翻译失败，第{retry_count}次重试: {str(e)}")
+                        timestamp_print(f"[llama-server翻译] 重新翻译失败，第{retry_count}次重试: {str(e)}")
+                        # 异常情况下继续重试
+                        remaining_indices.append(idx)
+                
+                # 打印当前批次的重新翻译结果
+                for idx in current_batch:
+                    original = segments[idx]["text"]
+                    translated = segments[idx].get("translated") or original
+                    orig_display = original[:50] + "..." if len(original) > 50 else original
+                    trans_display = translated[:50] + "..." if len(translated) > 50 else translated
+                    print(f"  [{idx+1}/{total_segments}] (重新翻译) {orig_display} -> {trans_display}")
             
-            # 再次检查是否还有未翻译的片段
-            final_untranslated = []
-            for i, (orig, trans) in enumerate(zip(texts, translations)):
-                similarity = self._calculate_similarity(orig, trans)
-                # 根据文本长度调整相似度阈值
-                text_length = len(orig)
-                if text_length <= 2:
-                    # 单个字符或两个字符，即使相似度高也视为已翻译
-                    # 因为很多日文中的单字在中文中是相同的
-                    threshold = 1.01  # 设置一个大于1的值，确保不会被视为未翻译
-                elif text_length <= 5:
-                    # 短文本，相似度阈值设为0.7
-                    threshold = 0.7
-                else:
-                    # 普通文本，相似度阈值设为0.8
-                    threshold = 0.8
-                if similarity > threshold:
-                    final_untranslated.append(i)
+            # 处理最终仍失败的片段
+            if remaining_indices:
+                print(f"[llama-server翻译] 仍有 {len(remaining_indices)} 个片段翻译失败，使用原文")
+                timestamp_print(f"[llama-server翻译] 仍有 {len(remaining_indices)} 个片段翻译失败，使用原文")
+                for idx in remaining_indices:
+                    segments[idx]["translated"] = segments[idx]["text"]
+                    text = segments[idx]["text"]
+                    print(f"  [{idx+1}/{total_segments}] (最终失败) 使用原文: {text[:50]}...")
             
-            if final_untranslated:
-                timestamp_print(f"[llama.cpp翻译] 仍有 {len(final_untranslated)} 个片段未翻译，使用原文")
-            else:
-                # 所有片段都已翻译
-                timestamp_print(f"[llama.cpp翻译] 批次翻译完成，所有片段都已翻译")
-            
-            return translations
-            
-        except Exception as e:
-            if retry_count < max_retries:
-                retry_count += 1
-                timestamp_print(f"[llama.cpp翻译] 批量翻译失败，第{retry_count}次重试: {str(e)}")
-                # 直接使用逐条翻译
-                translations = []
-                for text in texts:
-                    try:
-                        translated = self.translate(text, source_lang, target_lang, context_size)
-                        translations.append(translated)
-                    except Exception as e2:
-                        timestamp_print(f"[llama.cpp翻译] 逐条翻译失败: {str(e2)}")
-                        translations.append(text)
-                return translations
-            else:
-                # 最终失败，使用逐条翻译
-                timestamp_print(f"[llama.cpp翻译] 批量翻译失败，使用逐条翻译: {str(e)}")
-                translations = []
-                for text in texts:
-                    try:
-                        translated = self.translate(text, source_lang, target_lang, context_size)
-                        translations.append(translated)
-                    except Exception as e2:
-                        timestamp_print(f"[llama.cpp翻译] 逐条翻译失败: {str(e2)}")
-                        translations.append(text)
-                return translations
+            print(f"[llama-server翻译] 重新翻译完成")
+            timestamp_print(f"[llama-server翻译] 重新翻译完成")
+        else:
+            print(f"[llama-server翻译] 所有片段翻译成功，无需重新翻译")
+            timestamp_print(f"[llama-server翻译] 所有片段翻译成功，无需重新翻译")
+        
+        return segments
 
 
 def get_local_model_path(model_path):
@@ -1284,7 +1077,7 @@ def get_local_model_path(model_path):
 
 
 def translate_text(recognized_result, model_path, device_choice="auto", progress_callback=None,
-                   beam_size=1, max_length=256, target_language="zh", batch_size=32, context_size=None, max_output_tokens=8000):
+                   beam_size=1, max_length=256, target_language="zh", batch_size=2000, context_size=None, max_output_tokens=8000):
     """翻译识别结果"""
     if not target_language:
         target_language = "zh"
@@ -1301,177 +1094,98 @@ def translate_text(recognized_result, model_path, device_choice="auto", progress
         from config import config
         context_size = config.get('translation_context_size', 20000)
 
-    # 使用 llama-cli.exe 运行 GGUF 模型
-    return translate_with_llama_cpp(recognized_result, progress_callback, target_language, batch_size, context_size, max_output_tokens)
+    # 使用 llama-server HTTP API 运行 GGUF 模型
+    translated_result = translate_with_llama_server(recognized_result, progress_callback, target_language, batch_size, context_size, max_output_tokens)
+    
+    # 验证翻译结果
+    if 'segments' in translated_result:
+        has_translation = any('translated' in seg for seg in translated_result['segments'])
+        timestamp_print(f"[翻译] 翻译完成，{len(translated_result['segments'])} 个片段，其中 {sum(1 for seg in translated_result['segments'] if 'translated' in seg)} 个片段有翻译")
+    
+    return translated_result
 
 
-def translate_with_llama_cpp(recognized_result, progress_callback, target_language, batch_size=None, context_size=None, max_output_tokens=8000):
-    """使用 llama-cli.exe 运行 GGUF 模型进行翻译"""
+def translate_with_llama_server(recognized_result, progress_callback, target_language, batch_size=None, context_size=None, max_output_tokens=8000):
+    """使用 llama-server HTTP API 运行 GGUF 模型进行翻译"""
     from config import config
     
     # 从配置获取token限制（如果未指定）
     if batch_size is None:
-        batch_size = config.get('translation_batch_size', 4096)
+        batch_size = config.get('translation_batch_size', 3500)
     
-    timestamp_print(f"[llama.cpp翻译] 正在加载 GGUF 模型...")
-
-    # 使用单例模式获取翻译器实例
-    translator = LlamaCppTranslator()
-
-    segments = recognized_result["segments"]
-    total_segments_segments = len(segments)
-
-    # 获取源语言
-    source_language = recognized_result.get("language", "en")
-    
-    # 如果没有指定上下文大小，从配置中获取
     if context_size is None:
-        context_size = config.get('translation_context_size', 10000)
+        context_size = config.get('translation_context_size', 8192)
     
-    timestamp_print(f"[llama.cpp翻译] 开始处理 {total_segments_segments} 个片段...")
-    timestamp_print(f"[llama.cpp翻译] 源语言: {source_language}, 目标语言: {target_language}")
-    timestamp_print(f"[llama.cpp翻译] 上下文大小: {context_size}")
-    timestamp_print(f"[llama.cpp翻译] 每批最大token数: {batch_size}")
+    # 从识别结果中提取源语言
+    source_language = recognized_result.get('language', 'auto')
+    if source_language == 'auto':
+        # 自动检测语言
+        if recognized_result.get('text'):
+            # 简单语言检测
+            text = recognized_result['text']
+            if any('\u4e00' <= c <= '\u9fff' for c in text):
+                source_language = 'zh'
+            elif any('\u3040' <= c <= '\u30ff' for c in text):
+                source_language = 'ja'
+            elif any('\uac00' <= c <= '\ud7af' for c in text):
+                source_language = 'ko'
+            else:
+                source_language = 'en'
+        else:
+            source_language = 'en'
     
-    # 使用单次调用模式，避免Windows上的进程通信问题
-    timestamp_print("[llama.cpp翻译] 使用单次调用模式，批量翻译")
-
-    # 使用批量翻译
+    # 提取需要翻译的片段
+    segments = recognized_result.get('segments', [])
+    if not segments and recognized_result.get('text'):
+        # 如果没有段落，创建一个段落
+        segments = [{
+            'id': 0,
+            'text': recognized_result['text'],
+            'start': 0,
+            'end': 0
+        }]
+    
+    # 过滤文本中的标点符号
+    def clean_text_for_translation(text):
+        """去除标点符号，只保留文字和空格"""
+        import re
+        # 去除各种标点符号，保留字母、数字、汉字、假名等
+        # 保留日文假名、汉字、韩文、拉丁字母、数字
+        cleaned = re.sub(r'[^\u3040-\u309f\u30a0-\u30ff\u4e00-\u9faf\ac00-\ud7af\u0041-\u005a\u0061-\u007a\u0030-\u0039\s]', ' ', text)
+        # 去除多余空格
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        return cleaned
+    
+    # 对每个片段的文本进行清理
+    for seg in segments:
+        if 'text' in seg:
+            original_text = seg['text']
+            seg['original_text'] = original_text  # 保留原文
+            seg['text'] = clean_text_for_translation(original_text)
+    
+    # 初始化翻译器
+    translator = LlamaCppTranslator()
+    
     try:
-        # 智能分批
-        # 使用配置的token限制作为每批的最大token数
-        max_tokens_per_batch = batch_size
-        # 最大批次数量不设限制，由token数控制
-        max_batch_count = 64
-        batches = translator.split_into_smart_batches(
-            segments, 
-            max_tokens_per_batch=max_tokens_per_batch, 
-            max_batch_size=max_batch_count, 
-            max_output_tokens=max_output_tokens,
+        # 执行批量翻译
+        translated_segments = translator.translate_batch(
+            segments,
             source_lang=source_language,
-            target_lang=target_language
+            target_lang=target_language,
+            progress_callback=progress_callback,
+            batch_size=batch_size,
+            context_size=context_size,
+            max_output_tokens=max_output_tokens
         )
         
-        timestamp_print(f"[llama.cpp翻译] 智能分批完成，共 {len(batches)} 个批次")
+        # 更新识别结果
+        recognized_result['segments'] = translated_segments
         
-        processed_count = 0
-        for batch_num, batch in enumerate(batches, 1):
-            timestamp_print(f"[llama.cpp翻译] 处理第 {batch_num}/{len(batches)} 批，包含 {len(batch)} 个片段")
-            
-            # 提取该批次的所有原文
-            texts = [segment["text"] for segment in batch]
-            
-            try:
-                # 使用批量翻译（包含未翻译片段的单条翻译）
-                translations = translator._translate_batch_with_retry(
-                    batch, texts, source_language, target_language, context_size, max_output_tokens
-                )
-                
-                # 将翻译结果赋值给对应的片段
-                for i, (segment, translated) in enumerate(zip(batch, translations)):
-                    segment["translated"] = translated
-                    processed_count += 1
-                    if progress_callback and total_segments_segments > 0:
-                        progress_callback(int(processed_count / total_segments_segments * 100))
-                
-            except Exception as e:
-                timestamp_print(f"[llama.cpp翻译] 批量翻译失败，回退到逐条翻译: {str(e)}")
-                # 批量失败时，逐条翻译
-                for i, segment in enumerate(batch):
-                    original_text = segment["text"]
-                    try:
-                        translated_text = translator.translate(original_text, source_language, target_language, context_size)
-                        segment["translated"] = translated_text
-                    except Exception as e2:
-                        timestamp_print(f"[llama.cpp翻译] 翻译失败: {str(e2)}")
-                        segment["translated"] = original_text
-                    
-                    processed_count += 1
-                    if progress_callback and total_segments_segments > 0:
-                        progress_callback(int(processed_count / total_segments_segments * 100))
-            
-            # 计算实际tokens（使用与预估值相同的预处理）
-            actual_input_tokens = sum(translator.estimate_tokens(translator.preprocess_text(segment["text"]), source_language) for segment in batch)
-            actual_output_tokens = sum(translator.estimate_tokens(translator.preprocess_text(segment.get("translated", segment["text"])), target_language) for segment in batch)
-            
-            # 批量打印这一批的翻译结果
-            batch_start_idx = processed_count - len(batch) + 1
-            batch_end_idx = processed_count
-            timestamp_print(f"[翻译批次 {batch_num}/{len(batches)}] 完成 {batch_start_idx}-{batch_end_idx}/{total_segments_segments}:")
-            timestamp_print(f"  [Tokens] 实际输入: {actual_input_tokens}, 实际输出: {actual_output_tokens}")
-            for i, segment in enumerate(batch):
-                global_idx = batch_start_idx + i
-                original = segment["text"]
-                translated = segment.get("translated", original)
-                # 截断过长的文本以便显示
-                orig_display = original[:50] + "..." if len(original) > 50 else original
-                trans_display = translated[:50] + "..." if len(translated) > 50 else translated
-                print(f"  [{global_idx}/{total_segments_segments}] {orig_display} -> {trans_display}")
-    
-    except Exception as e:
-        timestamp_print(f"[llama.cpp翻译] 翻译过程失败: {str(e)}")
-        # 回退到逐条翻译
-        for i, segment in enumerate(segments):
-            original_text = segment["text"]
-            try:
-                translated_text = translator.translate(original_text, source_language, target_language, context_size)
-                segment["translated"] = translated_text
-            except Exception as e2:
-                timestamp_print(f"[llama.cpp翻译] 翻译失败: {str(e2)}")
-                segment["translated"] = original_text
-            
-            # 更新进度
-            if progress_callback and total_segments_segments > 0:
-                progress_callback(int((i + 1) / total_segments_segments * 100))
-            
-            # 打印翻译结果
-            orig_display = original_text[:50] + "..." if len(original_text) > 50 else original_text
-            trans_display = translated_text[:50] + "..." if len(translated_text) > 50 else translated_text
-            print(f"  [{i+1}/{total_segments_segments}] {orig_display} -> {trans_display}")
-
-    # 统计翻译结果
-    translated_count = 0
-    untranslated_count = 0
-    untranslated_list = []
-    
-    for i, segment in enumerate(segments):
-        original = segment.get('text', '')
-        translated = segment.get('translated', '')
+        # 构建翻译后的完整文本
+        translated_text = ''.join([seg.get('translated', seg.get('text', '')) for seg in translated_segments])
+        recognized_result['translated_text'] = translated_text
         
-        # 检查是否翻译
-        text_length = len(original)
-        if text_length <= 2:
-            # 单个字符或两个字符，即使与原文相同也视为已翻译
-            # 因为很多日文中的单字在中文中是相同的
-            if translated:
-                translated_count += 1
-            else:
-                untranslated_count += 1
-                untranslated_list.append((i + 1, original))
-        else:
-            # 普通文本，要求翻译结果与原文不同
-            if translated and translated != original:
-                translated_count += 1
-            else:
-                untranslated_count += 1
-                untranslated_list.append((i + 1, original))
-    
-    # 打印详细的统计结果
-    timestamp_print("\n翻译统计:")
-    timestamp_print(f"总片段数: {total_segments_segments}")
-    timestamp_print(f"已翻译: {translated_count}")
-    timestamp_print(f"未翻译: {untranslated_count}")
-    timestamp_print(f"翻译率: {translated_count/total_segments_segments*100:.1f}%")
-    
-    # 显示未翻译的片段
-    if untranslated_list:
-        timestamp_print(f"\n未翻译片段列表 (前20个):")
-        for idx, text in untranslated_list[:20]:
-            timestamp_print(f"  [{idx}] {text[:50]}...")
-    
-    # 翻译完成后保持进程运行，以便后续使用
-    timestamp_print(f"[llama.cpp翻译] 翻译完成，共翻译 {total_segments_segments} 个片段")
-    timestamp_print(f"[llama.cpp翻译] 服务器进程已保持，可用于后续翻译")
-
-    # 返回完整的识别结果，包含语言信息
-    return recognized_result
+        return recognized_result
+    finally:
+        # 清理资源
+        clear_translator_cache()

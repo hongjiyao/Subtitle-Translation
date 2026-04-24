@@ -51,19 +51,14 @@ if not ARIA2C_PATH:
 
 # 定义需要下载的模型
 MODELS = [
-    # Faster-Whisper系列模型 - 不同大小的版本
-    {"id": "Systran/faster-whisper-tiny", "dir": "Systran--faster-whisper-tiny", "priority": "medium", "type": "whisper", "download": True},
-    {"id": "Systran/faster-whisper-base", "dir": "Systran--faster-whisper-base", "priority": "medium", "type": "whisper", "download": False},
-    {"id": "Systran/faster-whisper-small", "dir": "Systran--faster-whisper-small", "priority": "medium", "type": "whisper", "download": False},
-    {"id": "Systran/faster-whisper-medium", "dir": "Systran--faster-whisper-medium", "priority": "medium", "type": "whisper", "download": True},
-    {"id": "Systran/faster-whisper-large-v2", "dir": "Systran--faster-whisper-large-v2", "priority": "high", "type": "whisper", "download": True},
-    {"id": "Systran/faster-whisper-large-v3", "dir": "Systran--faster-whisper-large-v3", "priority": "high", "type": "whisper", "download": False},
+    # 原始Whisper模型
+    {"id": "openai/whisper-large-v3-turbo", "dir": "openai--whisper-large-v3-turbo", "priority": "high", "type": "whisper", "download": True},
     # HY-MT1.5-7B-GGUF翻译模型
     {"id": "tencent/HY-MT1.5-7B-GGUF", "dir": "tencent--HY-MT1.5-7B-GGUF", "priority": "high", "type": "gguf", "download": True},
     # Wav2Vec2 对齐模型 - 多语言支持
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-english", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-english", "priority": "medium", "type": "wav2vec2", "download": True},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn", "priority": "medium", "type": "wav2vec2", "download": True},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-japanese", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-japanese", "priority": "medium", "type": "wav2vec2", "download": True},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-english", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-english", "priority": "medium", "type": "wav2vec2", "download": False},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn", "priority": "medium", "type": "wav2vec2", "download": False},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-japanese", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-japanese", "priority": "medium", "type": "wav2vec2", "download": False},
     {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-french", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-french", "priority": "low", "type": "wav2vec2", "download": False},
     {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-german", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-german", "priority": "low", "type": "wav2vec2", "download": False},
     {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-spanish", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-spanish", "priority": "low", "type": "wav2vec2", "download": False},
@@ -192,7 +187,7 @@ def check_model(model_id, local_dir, model_type):
     if model_type == "whisper":
         required_files = ["config.json", "tokenizer.json"]
         weight_files = ["model.bin", "model.safetensors", "pytorch_model.bin"]
-        vocab_files = ["vocabulary.txt", "vocabulary.json"]
+        vocab_files = ["vocabulary.txt", "vocab.json"]  # 修正：whisper 模型使用 vocab.json
     elif model_type == "gguf":
         # GGUF模型检查
         gguf_files = [f for f in os.listdir(local_dir) if f.endswith('.gguf')]
@@ -415,10 +410,16 @@ def download_model(model_info):
         # 只下载必要文件
         required_files = []
         if model_type == "gguf":
-            # GGUF模型只下载.gguf文件
-            for file in files:
-                if file.endswith(".gguf"):
-                    required_files.append(file)
+            # GGUF模型只下载.gguf文件，优先选择q4版本
+            q4_files = [file for file in files if file.endswith(".gguf") and "q4" in file.lower()]
+            if q4_files:
+                # 只下载q4版本
+                required_files = q4_files
+            else:
+                # 如果没有q4版本，下载所有gguf文件
+                for file in files:
+                    if file.endswith(".gguf"):
+                        required_files.append(file)
         elif model_type == "wav2vec2":
             # Wav2Vec2模型下载必要文件
             required_files = [
@@ -500,9 +501,10 @@ def test_model_usability(model_info):
     # 尝试导入必要的模块进行功能测试
     if model_type == "whisper":
         try:
-            from faster_whisper import WhisperModel
+            from transformers import WhisperForConditionalGeneration, WhisperProcessor
             log_message("尝试加载Whisper模型...")
-            model = WhisperModel(local_dir, device="cpu")
+            processor = WhisperProcessor.from_pretrained(local_dir, local_files_only=True)
+            model = WhisperForConditionalGeneration.from_pretrained(local_dir, local_files_only=True)
             log_message("[OK] Whisper模型加载成功")
             return True
         except Exception as e:

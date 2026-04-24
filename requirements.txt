@@ -4,23 +4,20 @@
 
 # 核心依赖
 openai-whisper==20250625
-faster-whisper==1.2.1
-transformers==4.57.6
-#torch==2.8.0
-#torchaudio==2.8.0
-#torchvision==0.23.0
-huggingface_hub==0.36.2
-ctranslate2==4.7.1
-onnxruntime==1.24.1
+transformers==5.5.4
+# torch==2.8.0+cu126
+# torchaudio==2.8.0+cu126
+# torchvision==0.23.0+cu126
+huggingface_hub==1.11.0
 sentencepiece==0.2.1
 tokenizers==0.22.2
 
 # Web和UI
-gradio==6.5.1
-gradio_client==2.0.3
-fastapi==0.128.3
-uvicorn==0.40.0
-python-multipart==0.0.22
+gradio==6.13.0
+gradio_client==2.5.0
+fastapi==0.136.0
+uvicorn==0.45.0
+python-multipart==0.0.26
 
 # 视频处理
 ffmpy==1.0.0
@@ -29,103 +26,42 @@ imageio-ffmpeg==0.6.0
 moviepy==2.2.1
 
 # 工具库
-numpy==2.3.5
-pandas==3.0.0
-pydantic==2.12.5
-pydantic_core==2.41.5
-requests==2.32.5
+numpy==2.4.4
+pandas==3.0.2
+pydantic==2.13.3
+pydantic_core==2.46.3
+requests==2.33.1
 tqdm==4.67.3
 
 # 其他支持库
-certifi==2026.1.4
-charset-normalizer==3.4.4
-click==8.3.1
+certifi==2026.2.25
+charset-normalizer==3.4.7
+click==8.3.2
 colorama==0.4.6
 decorator==5.2.1
-filelock==3.20.3
-fsspec==2026.2.0
+filelock==3.29.0
+fsspec==2026.3.0
 h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
-idna==3.11
+idna==3.12
 Jinja2==3.1.6
 MarkupSafe==3.0.3
-packaging==26.0
+packaging==26.1
 pillow==11.3.0
 pydub==0.25.1
 python-dateutil==2.9.0.post0
-pytz==2025.2
+pytz==2026.1.post1
 PyYAML==6.0.3
 urllib3==2.6.3
 
-# 额外库
-aiofiles==24.1.0
-annotated-doc==0.0.4
-annotated-types==0.7.0
-anyio==4.12.1
-av==16.1.0
-brotli==1.2.0
-ctransformers==0.2.27
-flatbuffers==25.12.19
-groovy==0.1.2
-hf-xet==1.2.0
-httptools==0.7.1
-llvmlite==0.46.0
-markdown-it-py==4.0.0
-mdurl==0.1.2
-more-itertools==10.8.0
-mpmath==1.3.0
-networkx==3.6.1
-numba==0.63.1
-orjson==3.11.7
-proglog==0.1.12
-protobuf==6.33.5
-py-cpuinfo==9.0.0
-Pygments==2.19.2
-python-dotenv==1.2.1
-regex==2026.1.15
-rich==14.3.2
-safehttpx==0.1.7
-safetensors==0.7.0
-semantic-version==2.10.0
-shellingham==1.5.4
-six==1.17.0
-starlette==0.52.1
-sympy==1.14.0
-tiktoken==0.12.0
-tomlkit==0.13.3
-typer==0.23.1
-typer-slim==0.23.1
-typing_extensions==4.15.0
-typing-inspection==0.4.2
-tzdata==2025.3
-watchfiles==1.1.1
-websocket-client==1.9.0
-websockets==16.0
-
 # 音频处理
-pyannote-audio==4.0.4
-pyannote-core==6.0.1
-pyannote-database==6.1.1
-pyannote-metrics==4.0.0
-pyannote-pipeline==4.0.0
-pyannoteai-sdk==0.4.0
-torch-audiomentations==0.12.0
-torch_pitch_shift==1.2.5
-torchcodec==0.10.0
-torchmetrics==1.8.2
-asteroid-filterbanks==0.4.0
-julius==0.2.7
+soundfile==0.13.1
+cffi==2.0.0
+pycparser==3.0
+silero-vad==6.2.1
 
-# WhisperX
-transformers[sentencepiece]==4.57.6
-whisperx==3.8.1
+# 模型加速
+accelerate==1.13.0
 
-# 其他
-nltk==3.9.3
-optuna==4.7.0
-psutil==7.2.2
-pytorch-lightning==2.6.1
-pytorch-metric-learning==2.9.0
-lightning==2.6.1
-lightning-utilities==0.15.3
+

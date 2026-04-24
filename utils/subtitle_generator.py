@@ -1,68 +1,120 @@
 # -*- coding: utf-8 -*-
+import os
+
 def generate_subtitle(translated_result, output_path, progress_callback=None):
     """生成字幕文件"""
-    print(f"正在生成字幕: {output_path}")
-    
+    base_name = os.path.basename(output_path)
+    name_without_ext = os.path.splitext(base_name)[0]
+    output_dir = "outputs"
+    output_path = os.path.join(output_dir, f"{name_without_ext}.srt")
+
+    print(f"正在生成原文字幕: {output_path}")
+
     try:
-        total_segments = len(translated_result["segments"])
-        
-        # 获取语言信息
-        language = translated_result.get("language", "en")
-        
-        # 定义不需要空格的语言列表
-        no_space_languages = ["zh", "zh-Hant", "ja", "ko", "th", "vi", "my", "km", "bo", "ug"]
-        
-        # 判断当前语言是否需要空格
-        needs_spaces = language not in no_space_languages
-        
-        print(f"检测到语言: {language}, {'需要空格' if needs_spaces else '不需要空格'}")
-        
-        # 使用缓冲区减少磁盘操作
-        subtitle_content = []
-        
-        for i, segment in enumerate(translated_result["segments"]):
-            # 构建字幕内容
-            subtitle_content.append(f"{i+1}")
-            
-            # 写入时间轴
-            start_time = format_time(segment["start"])
-            end_time = format_time(segment["end"])
-            subtitle_content.append(f"{start_time} --> {end_time}")
-            
-            # 只写入中文译文，不显示原文
-            if "translated" in segment:
-                text = segment['translated']
-            else:
-                # 如果没有译文，则使用原文
-                text = segment['text']
-            
-            # 根据语言类型处理空格
-            if needs_spaces:
-                # 需要空格的语言：移除首尾空格，保留单词间的单个空格
-                text = text.strip()
-                text = ' '.join(text.split())
-            else:
-                # 不需要空格的语言：移除所有空格
-                text = text.replace(' ', '')
-            
-            subtitle_content.append(f"{text}")
-            
-            # 空行分隔
-            subtitle_content.append("")
-            
-            # 更新进度条（如果有）
-            if progress_callback and total_segments > 0:
-                progress = int(((i + 1) / total_segments) * 100)
-                progress_callback(progress)
-        
-        # 一次性写入文件
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(subtitle_content))
-        
-        print(f"字幕生成完成: {output_path}")
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for i, seg in enumerate(translated_result.get('segments', []), 1):
+                f.write(f"{i}\n")
+
+                start = seg.get('start', 0)
+                end = seg.get('end', 0)
+                start_time = format_time(start)
+                end_time = format_time(end)
+                f.write(f"{start_time} --> {end_time}\n")
+
+                text = seg.get('text', '')
+                f.write(f"{text}\n\n")
+
+        print(f"原文字幕生成完成: {output_path}")
         return output_path
     except Exception as e:
-        print(f"字幕生成失败: {str(e)}")
+        print(f"原文字幕生成失败: {str(e)}")
+        raise
+
+def generate_translated_subtitle(translated_result, output_path, progress_callback=None):
+    """生成译文字幕文件
+
+    Args:
+        translated_result: 包含翻译结果的字典
+        output_path: 输出文件路径（不应该包含 _translated 后缀）
+        progress_callback: 进度回调
+    """
+    import os as os_module
+
+    print(f"正在生成译文字幕: {output_path}")
+
+    try:
+        output_dir = os_module.path.dirname(output_path) or "outputs"
+        base_name = os_module.path.basename(output_path)
+        name_without_ext = os_module.path.splitext(base_name)[0]
+
+        final_output_path = os_module.path.join(output_dir, f"{name_without_ext}.srt")
+
+        os_module.makedirs(output_dir, exist_ok=True)
+
+        with open(final_output_path, 'w', encoding='utf-8') as f:
+            for i, seg in enumerate(translated_result.get('segments', []), 1):
+                f.write(f"{i}\n")
+
+                start = seg.get('start', 0)
+                end = seg.get('end', 0)
+                start_time = format_time(start)
+                end_time = format_time(end)
+                f.write(f"{start_time} --> {end_time}\n")
+
+                if 'translated' in seg:
+                    text = seg['translated']
+                else:
+                    text = seg.get('text', '')
+                f.write(f"{text}\n\n")
+
+        print(f"译文字幕生成完成: {final_output_path}")
+        return final_output_path
+    except Exception as e:
+        print(f"译文字幕生成失败: {str(e)}")
+        raise
+
+def generate_bilingual_subtitle(translated_result, output_path, progress_callback=None):
+    """生成双语字幕文件
+
+    Args:
+        translated_result: 包含翻译结果的字典
+        output_path: 输出文件路径
+        progress_callback: 进度回调
+    """
+    import os as os_module
+
+    print(f"正在生成双语字幕: {output_path}")
+
+    try:
+        output_dir = os_module.path.dirname(output_path) or "outputs"
+        base_name = os_module.path.basename(output_path)
+        name_without_ext = os_module.path.splitext(base_name)[0]
+
+        final_output_path = os_module.path.join(output_dir, f"{name_without_ext}.srt")
+
+        os_module.makedirs(output_dir, exist_ok=True)
+
+        with open(final_output_path, 'w', encoding='utf-8') as f:
+            for i, seg in enumerate(translated_result.get('segments', []), 1):
+                f.write(f"{i}\n")
+
+                start = seg.get('start', 0)
+                end = seg.get('end', 0)
+                start_time = format_time(start)
+                end_time = format_time(end)
+                f.write(f"{start_time} --> {end_time}\n")
+
+                original_text = seg.get('original_text', seg.get('text', ''))
+                translated_text = seg.get('translated', '')
+                f.write(f"{original_text}\n{translated_text}\n\n")
+
+        print(f"双语字幕生成完成: {final_output_path}")
+        return final_output_path
+    except Exception as e:
+        print(f"双语字幕生成失败: {str(e)}")
         raise
 
 def format_time(seconds):

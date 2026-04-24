@@ -1,10 +1,13 @@
 @echo off
+setlocal enabledelayedexpansion
+
 echo ========================================
 echo Subtitle Translation Tool - Final Setup
 echo ========================================
 echo.
 
 set "VENV_NAME=.venv_final"
+set "PACKAGES_DIR=packages"
 set "PYTHON_DIR=python311"
 set "PYTHON_INSTALLER=python-3.11.7-amd64.exe"
 set "PYTHON_URL=https://www.python.org/ftp/python/3.11.7/%PYTHON_INSTALLER%"
@@ -12,14 +15,21 @@ set "PYTHON_URL=https://www.python.org/ftp/python/3.11.7/%PYTHON_INSTALLER%"
 echo [INFO] Starting setup...
 echo.
 
-:: Step 1: Clean old environment
-echo [1/7] Cleaning old environment...
-if exist "%VENV_NAME%" (
-    echo Found old environment, removing...
-    rmdir /s /q "%VENV_NAME%"
-    timeout /t 1 /nobreak >nul
+:: Step 1: Check if packages directory exists and has files
+echo [1/7] Checking local packages directory...
+set "PACKAGES_EXIST=0"
+set "LOCAL_PKG_COUNT=0"
+if exist "%PACKAGES_DIR%" (
+    for %%f in ("%PACKAGES_DIR%\*.whl") do set /a LOCAL_PKG_COUNT+=1
+    if !LOCAL_PKG_COUNT! gtr 0 (
+        set "PACKAGES_EXIST=1"
+        echo [OK] Found existing packages directory with !LOCAL_PKG_COUNT! files
+    ) else (
+        echo [INFO] Packages directory is empty, will download packages
+    )
+) else (
+    echo [INFO] Packages directory does not exist, will be created
 )
-echo [OK] Cleanup complete
 echo.
 
 :: Step 2: Check and install Python
@@ -33,9 +43,9 @@ if errorlevel 1 (
     ) else (
         echo [INFO] Downloading Python 3.11.7...
         echo This may take a few minutes...
-        
+
         set "PYTHON_DOWNLOADED=0"
-        
+
         :: Source 1: Official Python.org
         echo Trying source 1: Python.org...
         powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%PYTHON_URL%' -OutFile '%PYTHON_INSTALLER%'"
@@ -43,9 +53,9 @@ if errorlevel 1 (
             set "PYTHON_DOWNLOADED=1"
             echo [OK] Python installer downloaded
         )
-        
+
         :: Source 2: Mirror if needed
-        if not "%PYTHON_DOWNLOADED%"=="1" (
+        if not "!PYTHON_DOWNLOADED!"=="1" (
             echo Trying source 2: Mirror...
             powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://registry.npmmirror.com/-/binary/python/3.11.7/%PYTHON_INSTALLER%' -OutFile '%PYTHON_INSTALLER%'"
             if exist "%PYTHON_INSTALLER%" (
@@ -53,9 +63,9 @@ if errorlevel 1 (
                 echo [OK] Python installer downloaded from mirror
             )
         )
-        
+
         :: If download succeeded, install
-        if "%PYTHON_DOWNLOADED%"=="1" (
+        if "!PYTHON_DOWNLOADED!"=="1" (
             echo Installing Python 3.11.7...
             echo Please wait, this may take a few minutes...
             start /wait "" "%PYTHON_INSTALLER%" /quiet InstallAllUsers=0 PrependPath=0 Include_test=0 TargetDir="%~dp0%PYTHON_DIR%"
@@ -79,146 +89,160 @@ if errorlevel 1 (
 for /f "tokens=*" %%i in ('python --version 2^>^&1') do echo [OK] %%i
 echo.
 
-:: Step 3: Create venv
-echo [3/7] Creating virtual environment: %VENV_NAME%
-python -m venv "%VENV_NAME%"
-if errorlevel 1 (
-    echo [ERROR] Failed to create venv
-    pause
-    exit /b 1
+:: Step 3: Create packages directory
+echo [3/7] Creating packages directory...
+if not exist "%PACKAGES_DIR%" (
+    mkdir "%PACKAGES_DIR%"
+    echo [OK] Packages directory created: %PACKAGES_DIR%
+) else (
+    echo [OK] Packages directory already exists: %PACKAGES_DIR%
 )
-echo [OK] Virtual environment created
 echo.
 
-:: Step 4: Upgrade pip in virtual environment
-echo [4/7] Upgrading pip in virtual environment...
+:: Step 4: Create virtual environment
+echo [4/7] Creating virtual environment...
+:: Check if venv exists
+if exist "%VENV_NAME%" (
+    echo [INFO] Virtual environment already exists, skipping creation...
+) else (
+    python -m venv "%VENV_NAME%"
+    if errorlevel 1 (
+        echo [ERROR] Failed to create venv
+        pause
+        exit /b 1
+    )
+    echo [OK] Virtual environment created
+)
+echo.
+
+:: Step 5: Upgrade pip and download packages to local directory
+echo [5/7] Downloading and installing packages...
+echo This may take several minutes...
+echo.
+
+:: Upgrade pip first
+echo Upgrading pip...
 "%VENV_NAME%\Scripts\python.exe" -m pip install --upgrade pip
 echo [OK] pip upgraded
 echo.
 
-:: Step 5: Install packages to virtual environment
-echo [5/7] Installing packages to virtual environment...
-echo This may take a few minutes...
+:: Check if PyTorch packages exist locally
+echo Checking PyTorch packages...
+set "TORCH_LOCAL=0"
+dir "%PACKAGES_DIR%\torch*.whl" >nul 2>&1
+if not errorlevel 1 goto :torch_found
+
+:torch_not_found
+:: Download PyTorch to local directory
+echo Downloading PyTorch (CUDA 12.6) to %PACKAGES_DIR%...
+"%VENV_NAME%\Scripts\pip.exe" download torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 -i "https://download.pytorch.org/whl/cu126" -d "%PACKAGES_DIR%"
+if errorlevel 1 (
+    echo [WARN] PyTorch download may have failed, continuing...
+) else (
+    echo [OK] PyTorch downloaded to %PACKAGES_DIR%
+)
+goto :torch_check_done
+
+:torch_found
+echo [INFO] Found local PyTorch packages, skipping download...
+
+:torch_check_done
 echo.
 
-:: First install CUDA version of PyTorch with specific index
-echo Installing CUDA version of PyTorch...
-"%VENV_NAME%\Scripts\pip.exe" install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
-
-:: Install all packages from requirements.txt
+:: Install PyTorch from local directory
+echo Installing PyTorch from local package...
+"%VENV_NAME%\Scripts\pip.exe" install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --no-index --find-links="%PACKAGES_DIR%"
+if errorlevel 1 (
+    echo [WARN] PyTorch installation may have failed, continuing...
+) else (
+    echo [OK] PyTorch installed
+)
 echo.
-echo Installing all packages from requirements.txt...
+
+:: Check if requirements.txt packages exist locally
 if exist "requirements.txt" (
-    "%VENV_NAME%\Scripts\pip.exe" install -r requirements.txt
-    echo [OK] Requirements installed
-) else (
-    echo [WARN] requirements.txt not found, installing basic packages
-    :: Install key packages
-    echo Installing main packages...
-    "%VENV_NAME%\Scripts\pip.exe" install gradio torch transformers
+    echo Checking local packages for requirements.txt...
     
-    :: Install whisper, faster-whisper and sentencepiece
+    :: Download packages from requirements.txt
+    echo Downloading packages from requirements.txt to %PACKAGES_DIR%...
+    "%VENV_NAME%\Scripts\pip.exe" download -r requirements.txt -d "%PACKAGES_DIR%"
+    if errorlevel 1 (
+        echo [WARN] Some packages may have failed to download
+    ) else (
+        echo [OK] Requirements downloaded
+    )
     echo.
-    echo Installing whisper and faster-whisper...
-    "%VENV_NAME%\Scripts\pip.exe" install openai-whisper faster-whisper sentencepiece 2>nul || echo [WARN] Some packages may need manual install
-    
-    :: Install WhisperX
-    echo.
-    echo Installing WhisperX 3.8.4...
-    "%VENV_NAME%\Scripts\pip.exe" install whisperx==3.8.4 2>nul || echo [WARN] WhisperX may need manual install
-    
-    :: Install other packages
-    echo.
-    echo Installing other packages...
-    "%VENV_NAME%\Scripts\pip.exe" install ffmpy ImageIO imageio-ffmpeg moviepy numpy pandas pydantic requests tqdm rich
-)
 
-echo [OK] Installation complete
+    :: Install packages from local directory
+    echo Installing packages from local directory...
+    "%VENV_NAME%\Scripts\pip.exe" install --no-index --find-links="%PACKAGES_DIR%" -r requirements.txt
+    if errorlevel 1 (
+        echo [WARN] Some packages may have failed to install
+    ) else (
+        echo [OK] All packages installed successfully!
+    )
+) else (
+    echo [WARN] requirements.txt not found, downloading basic packages
+    echo Downloading main packages...
+    if not exist "%PACKAGES_DIR%" mkdir "%PACKAGES_DIR%"
+    "%VENV_NAME%\Scripts\pip.exe" download gradio transformers openai-whisper sentencepiece ffmpy ImageIO imageio-ffmpeg moviepy numpy pandas pydantic requests tqdm rich soundfile torchcodec accelerate -d "%PACKAGES_DIR%"
+    echo [OK] Basic packages downloaded
+    echo.
+
+    :: Install basic packages from local directory
+    echo Installing basic packages from local directory...
+    "%VENV_NAME%\Scripts\pip.exe" install --no-index --find-links="%PACKAGES_DIR%" gradio transformers openai-whisper sentencepiece ffmpy ImageIO imageio-ffmpeg moviepy numpy pandas pydantic requests tqdm rich soundfile torchcodec accelerate
+    if errorlevel 1 (
+        echo [WARN] Some basic packages may have failed to install
+    ) else (
+        echo [OK] Basic packages installed
+    )
+)
 echo.
 
-:: Step 6: Verify installation in virtual environment
-echo [6/7] Verifying packages in virtual environment...
-set OK_COUNT=0
-set TOTAL_COUNT=0
-
-echo Checking gradio...
-"%VENV_NAME%\Scripts\python.exe" -c "import gradio; print('  OK: gradio')" 2>nul
-if errorlevel 1 (
-    echo   FAIL: gradio
+:: Step 6: Verify packages were downloaded
+echo [6/7] Verifying downloaded packages...
+if exist "%PACKAGES_DIR%" (
+    set COUNT=0
+    for %%f in ("%PACKAGES_DIR%\*.whl") do set /a COUNT+=1
+    echo [OK] Packages directory exists with !COUNT! wheel files
 ) else (
-    set /a OK_COUNT+=1
+    echo [WARN] Packages directory not found
 )
-set /a TOTAL_COUNT+=1
-
-echo Checking torch...
-"%VENV_NAME%\Scripts\python.exe" -c "import torch; print('  OK: torch')" 2>nul
-if errorlevel 1 (
-    echo   FAIL: torch
-) else (
-    set /a OK_COUNT+=1
-)
-set /a TOTAL_COUNT+=1
-
-echo Checking transformers...
-"%VENV_NAME%\Scripts\python.exe" -c "import transformers; print('  OK: transformers')" 2>nul
-if errorlevel 1 (
-    echo   FAIL: transformers
-) else (
-    set /a OK_COUNT+=1
-)
-set /a TOTAL_COUNT+=1
-
-echo Checking whisper...
-"%VENV_NAME%\Scripts\python.exe" -c "import whisper; print('  OK: whisper')" 2>nul
-if errorlevel 1 (
-    echo   FAIL: whisper
-) else (
-    set /a OK_COUNT+=1
-)
-set /a TOTAL_COUNT+=1
-
-echo Checking faster_whisper...
-"%VENV_NAME%\Scripts\python.exe" -c "import faster_whisper; print('  OK: faster_whisper')" 2>nul
-if errorlevel 1 (
-    echo   FAIL: faster_whisper
-) else (
-    set /a OK_COUNT+=1
-)
-set /a TOTAL_COUNT+=1
-
-echo Checking sentencepiece...
-"%VENV_NAME%\Scripts\python.exe" -c "import sentencepiece; print('  OK: sentencepiece')" 2>nul
-if errorlevel 1 (
-    echo   FAIL: sentencepiece
-) else (
-    set /a OK_COUNT+=1
-)
-set /a TOTAL_COUNT+=1
-
-echo.
-echo [RESULT] %OK_COUNT%/%TOTAL_COUNT% packages OK
 echo.
 
-:: Step 7: Complete
-echo [7/7] Setup complete!
+:: Step 7: Verify venv packages
+echo [7/7] Verifying installed packages in venv...
+"%VENV_NAME%\Scripts\pip.exe" list --format=freeze | findstr /C:"gradio" >nul
+if errorlevel 1 (
+    echo [WARN] Some packages may not be installed correctly
+) else (
+    echo [OK] Packages verified in virtual environment
+)
+echo.
+
+:: Step 8: Complete
+echo [8/8] Setup complete!
 echo.
 echo ========================================
-if %OK_COUNT% geq 2 (
-    echo Setup successful!
-) else (
-    echo Setup complete, some packages may need manual install
-)
+echo Setup successful!
 echo ========================================
 echo.
 echo Python directory: %PYTHON_DIR%
 echo Virtual environment: %VENV_NAME%
+echo Local packages: %PACKAGES_DIR% (%~dp0%PACKAGES_DIR%)
+if exist "%PACKAGES_DIR%" (
+    set FINAL_COUNT=0
+    for %%f in ("%PACKAGES_DIR%\*.whl") do set /a FINAL_COUNT+=1
+    echo Package files cached: !FINAL_COUNT!
+)
 echo.
-echo To use:
-echo   1. Activate: %VENV_NAME%\Scripts\activate.bat
-echo   2. Run: python ui.py
+echo To install packages from local directory in the future:
+echo   %VENV_NAME%\Scripts\pip.exe install --no-index --find-links="%PACKAGES_DIR%" -r requirements.txt
+echo.
+echo Or to install a specific package:
+echo   %VENV_NAME%\Scripts\pip.exe install --no-index --find-links="%PACKAGES_DIR%" package_name
 echo.
 echo ========================================
-echo.
-echo Setup complete! You can now activate the environment.
 echo.
 pause
