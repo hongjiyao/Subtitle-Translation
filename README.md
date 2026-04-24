@@ -167,7 +167,7 @@ Subtitle-TranslationA/
 - **Gradio**：Web界面框架
 - **FFmpeg**：视频处理工具
 - **llama.cpp**：模型量化库
-```
+
 
 
 **Subtitle-TranslationA** - 让视频字幕翻译变得简单高效！
