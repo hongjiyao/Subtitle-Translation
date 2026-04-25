@@ -142,7 +142,7 @@ class LlamaServerManager:
             "-m", self.model_path,
             "--host", self.host,
             "--port", str(self.port),
-            "-c", "4096",  # 设置上下文大小为4096
+            "-c", str(self.context_size),
             "-b", "2048",  # 设置批处理大小为2048
             "-t", str(self.threads),
             "-ngl", "99",

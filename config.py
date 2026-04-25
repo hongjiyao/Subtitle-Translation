@@ -51,7 +51,7 @@ PARAM_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "目标语言（翻译输出语言）"
     },
     "vad_threshold": {
-        "default": 0.2,
+        "default": 0.3,
         "range": [0.1, 0.9],
         "description": "VAD 语音活动检测阈值"
     },
@@ -81,9 +81,9 @@ PARAM_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "VAD 前缀填充时间（毫秒）"
     },
     "vad_neg_threshold": {
-        "default": None,
+        "default": 0.15,
         "range": [0.0, 1.0],
-        "description": "VAD 静音判定阈值，默认为 threshold-0.15"
+        "description": "VAD 静音判定阈值"
     },
     "use_max_poss_sil_at_max_speech": {
         "default": True,
@@ -112,21 +112,6 @@ PARAM_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "default": 7.0,
         "range": [0.0, 15.0],
         "description": "Whisper-CD 音频时间移位的秒数"
-    },
-    "whispercd_score_threshold": {
-        "default": 0.3,
-        "range": [0.0, 1.0],
-        "description": "Whisper-CD 一致性分数阈值"
-    },
-    "whispercd_batch_size": {
-        "default": 10,
-        "range": [1, 16],
-        "description": "Whisper-CD 批量处理大小"
-    },
-    "whispercd_context_segments": {
-        "default": 1,
-        "range": [1, 500],
-        "description": "Whisper-CD 上下文片段数"
     },
     "enable_forced_alignment": {
         "default": False,
@@ -172,7 +157,7 @@ PARAM_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "Llama Server 服务器端口"
     },
     "llama_server_context_size": {
-        "default": 8192,
+        "default": 4096,
         "range": [512, 32768],
         "description": "Llama Server 上下文大小"
     },

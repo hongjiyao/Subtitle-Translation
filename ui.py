@@ -68,9 +68,6 @@ def add_to_queue(video):
             'whispercd_temperature': config.get('whispercd_temperature', 1.0),
             'whispercd_snr_db': config.get('whispercd_snr_db', 10.0),
             'whispercd_temporal_shift': config.get('whispercd_temporal_shift', 7.0),
-            'whispercd_score_threshold': config.get('whispercd_score_threshold', 0.3),
-            'whispercd_batch_size': config.get('whispercd_batch_size', 4),
-            'whispercd_context_segments': config.get('whispercd_context_segments', 10),
             'enable_forced_alignment': config.get('enable_forced_alignment', True),
             'vad_threshold': config.get('vad_threshold', 0.4),
             'vad_min_speech_duration': config.get('vad_min_speech_duration', 1.0),
@@ -148,12 +145,8 @@ def save_config(model, translator, translator_quantization, device, source_langu
                 vad_threshold, vad_min_speech_duration, vad_max_speech_duration, vad_min_silence_duration,
                 vad_speech_pad_ms, vad_prefix_padding_ms, vad_neg_threshold, use_max_poss_sil_at_max_speech,
                 enable_whispercd, whispercd_alpha, whispercd_temperature, whispercd_snr_db, whispercd_temporal_shift,
-                whispercd_score_threshold, whispercd_batch_size, whispercd_context_segments,
-                enable_forced_alignment, translation_batch_size, translation_context_size, translation_temperature,
-                translation_top_k, translation_top_p, translation_repetition_penalty,
                 llama_server_host, llama_server_port, llama_server_context_size, llama_server_threads):
     try:
-        # 保存所有配置参数
         success, msg = config.save(
             model=model,
             translator=translator,
@@ -174,16 +167,6 @@ def save_config(model, translator, translator_quantization, device, source_langu
             whispercd_temperature=whispercd_temperature,
             whispercd_snr_db=whispercd_snr_db,
             whispercd_temporal_shift=whispercd_temporal_shift,
-            whispercd_score_threshold=whispercd_score_threshold,
-            whispercd_batch_size=whispercd_batch_size,
-            whispercd_context_segments=whispercd_context_segments,
-            enable_forced_alignment=enable_forced_alignment,
-            translation_batch_size=translation_batch_size,
-            translation_context_size=translation_context_size,
-            translation_temperature=translation_temperature,
-            translation_top_k=translation_top_k,
-            translation_top_p=translation_top_p,
-            translation_repetition_penalty=translation_repetition_penalty,
             llama_server_host=llama_server_host,
             llama_server_port=llama_server_port,
             llama_server_context_size=llama_server_context_size,
@@ -263,19 +246,6 @@ with gr.Blocks() as demo:
                 whispercd_temperature = gr.Slider(minimum=0.1, maximum=5.0, value=config.get('whispercd_temperature', 1.0), label="log-sum-exp温度参数")
                 whispercd_snr_db = gr.Slider(minimum=0.0, maximum=30.0, value=config.get('whispercd_snr_db', 10.0), label="高斯噪声注入的SNR值")
                 whispercd_temporal_shift = gr.Slider(minimum=0.0, maximum=15.0, value=config.get('whispercd_temporal_shift', 7.0), label="音频时间移位的秒数")
-                whispercd_score_threshold = gr.Slider(minimum=0.0, maximum=1.0, value=config.get('whispercd_score_threshold', 0.3), label="一致性分数阈值")
-                whispercd_batch_size = gr.Slider(minimum=1, maximum=16, value=config.get('whispercd_batch_size', 10), label="批量处理大小")
-                whispercd_context_segments = gr.Slider(minimum=1, maximum=500, value=config.get('whispercd_context_segments', 1), label="上下文片段数")
-            
-            # 翻译设置
-            with gr.Accordion("翻译设置", open=False):
-                enable_forced_alignment = gr.Checkbox(value=config.get('enable_forced_alignment', True), label="启用强制对齐")
-                translation_batch_size = gr.Slider(minimum=1024, maximum=8192, value=config.get('translation_batch_size', 2000), label="翻译批处理大小")
-                translation_context_size = gr.Slider(minimum=1024, maximum=32768, value=config.get('translation_context_size', 8192), label="翻译模型上下文大小")
-                translation_temperature = gr.Slider(minimum=0.0, maximum=2.0, value=config.get('translation_temperature', 0.0), label="翻译模型温度参数")
-                translation_top_k = gr.Slider(minimum=1, maximum=100, value=config.get('translation_top_k', 20), label="翻译模型Top-K采样参数")
-                translation_top_p = gr.Slider(minimum=0.0, maximum=1.0, value=config.get('translation_top_p', 0.6), label="翻译模型Top-P参数")
-                translation_repetition_penalty = gr.Slider(minimum=1.0, maximum=2.0, value=config.get('translation_repetition_penalty', 1.05), label="翻译模型重复惩罚参数")
             
             # Llama Server设置
             with gr.Accordion("Llama Server设置", open=False):
@@ -300,9 +270,6 @@ with gr.Blocks() as demo:
                     vad_threshold, vad_min_speech_duration, vad_max_speech_duration, vad_min_silence_duration,
                     vad_speech_pad_ms, vad_prefix_padding_ms, vad_neg_threshold, use_max_poss_sil_at_max_speech,
                     enable_whispercd, whispercd_alpha, whispercd_temperature, whispercd_snr_db, whispercd_temporal_shift,
-                    whispercd_score_threshold, whispercd_batch_size, whispercd_context_segments,
-                    enable_forced_alignment, translation_batch_size, translation_context_size, translation_temperature,
-                    translation_top_k, translation_top_p, translation_repetition_penalty,
                     llama_server_host, llama_server_port, llama_server_context_size, llama_server_threads
                 ],
                 outputs=[config_status]

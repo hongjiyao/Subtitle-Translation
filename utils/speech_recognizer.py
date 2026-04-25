@@ -1024,11 +1024,8 @@ def recognize_speech_enhanced(audio_path, model_path, detected_language=None, de
             temperature=config.get("whispercd_temperature", 1.0),
             snr_db=config.get("whispercd_snr_db", 10),
             temporal_shift=config.get("whispercd_temporal_shift", 7),
-            score_threshold=config.get("whispercd_score_threshold", 0.3),
-            batch_size=config.get("whispercd_batch_size", 4),
             enable_alignment=enable_alignment,
-            speech_segments=speech_segments if enable_vad else None,
-            context_segments=config.get("whispercd_context_segments", 10)
+            speech_segments=speech_segments if enable_vad else None
         )
 
         timestamp_print("[Whisper-CD] 应用对比解码...")
