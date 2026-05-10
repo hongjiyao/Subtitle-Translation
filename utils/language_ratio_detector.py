@@ -238,6 +238,29 @@ def check_translation_success(
     return success, target_ratio, lang_counts
 
 
+def is_translation_valid(original_text, translated_text, source_lang='ja', target_lang='zh', threshold=0.5):
+    if not translated_text:
+        return False, 0.0, {}
+    
+    if original_text == translated_text and source_lang != target_lang:
+        return False, 0.0, {}
+    
+    if len(translated_text) <= 5:
+        if original_text.strip() == translated_text.strip():
+            return False, 0.0, {}
+        success, target_ratio, lang_counts = check_translation_success(
+            original_text, translated_text, source_lang, target_lang, threshold=0.3
+        )
+        if not success and target_ratio < 0.2:
+            return False, target_ratio, lang_counts
+    
+    success, target_ratio, lang_counts = check_translation_success(
+        original_text, translated_text, source_lang, target_lang, threshold=threshold
+    )
+    
+    return success, target_ratio, lang_counts
+
+
 def get_translation_quality_info(
     original_text: str,
     translated_text: str,

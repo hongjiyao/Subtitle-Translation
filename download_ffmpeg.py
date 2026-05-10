@@ -1,34 +1,13 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
-
-# 强制使用 UTF-8 编码
-os.environ['PYTHONIOENCODING'] = 'utf-8'
-os.environ['LC_ALL'] = 'en_US.UTF-8'
-os.environ['LANG'] = 'en_US.UTF-8'
-
 import subprocess
 import zipfile
 import shutil
 import time
 
-def log_message(message, level="INFO"):
-    """记录日志信息"""
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    
-    # 根据级别设置前缀
-    if level == "INFO":
-        prefix = "[INFO]"
-    elif level == "ERROR":
-        prefix = "[ERROR]"
-    elif level == "SUCCESS":
-        prefix = "[SUCCESS]"
-    elif level == "WARN":
-        prefix = "[WARN]"
-    else:
-        prefix = "[INFO]"
-    
-    print(f"{timestamp} {prefix} {message}")
+from utils.logger import log_message
+from utils.download_utils import download_with_progress, verify_zip
 
 
 
@@ -57,64 +36,19 @@ for source_name, url in sources:
     zip_path = os.path.join(ffmpeg_dir, "ffmpeg.zip")
     
     try:
-        import requests
-        from tqdm import tqdm
-        
-        # 检查文件是否已存在且有部分内容
-        resume_header = {}
-        file_size = 0
-        if os.path.exists(zip_path):
-            file_size = os.path.getsize(zip_path)
-            if file_size > 0:
-                resume_header['Range'] = f'bytes={file_size}-'
-                log_message(f"继续下载，已下载 {file_size / (1024*1024):.2f} MB", "INFO")
-        
-        response = requests.get(url, stream=True, headers=resume_header, timeout=60)
-        response.raise_for_status()
-        
-        # 获取总文件大小
-        total_size = int(response.headers.get('content-length', 0))
-        if 'Content-Range' in response.headers:
-            # 处理续传情况
-            content_range = response.headers['Content-Range']
-            total_size = int(content_range.split('/')[-1])
-        
-        block_size = 1024 * 1024  # 1MB
-        
-        # 以追加模式打开文件
-        mode = 'ab' if file_size > 0 else 'wb'
-        with open(zip_path, mode) as f, tqdm(
-            desc=os.path.basename(zip_path),
-            total=total_size,
-            initial=file_size,
-            unit='B',
-            unit_scale=True,
-            unit_divisor=1024,
-        ) as bar:
-            for data in response.iter_content(block_size):
-                size = f.write(data)
-                bar.update(size)
-        
-        print("\n[OK] Download complete!")
-        
-        # 验证下载的文件是否为有效的ZIP文件
-        log_message("Verifying ZIP file...")
-        try:
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                # 检查ZIP文件是否有效
-                zip_ref.testzip()
+        if download_with_progress(url, zip_path):
+            print("\n[OK] Download complete!")
+            
+            if not verify_zip(zip_path):
+                log_message("ZIP file is corrupted", "ERROR")
+                if os.path.exists(zip_path):
+                    os.remove(zip_path)
+                log_message("Trying next source...", "INFO")
+                print()
+                continue
             log_message("ZIP file verification passed", "INFO")
-        except zipfile.BadZipFile as e:
-            log_message(f"ZIP file is corrupted: {str(e)}", "ERROR")
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
-            log_message("Trying next source...", "INFO")
-            print()
-            continue
-        except Exception as e:
-            log_message(f"Error verifying ZIP file: {str(e)}", "ERROR")
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
+        else:
+            log_message("Download failed", "ERROR")
             log_message("Trying next source...", "INFO")
             print()
             continue

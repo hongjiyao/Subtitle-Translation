@@ -4,6 +4,8 @@
 import logging
 import sys
 import os
+import re
+import time
 from pathlib import Path
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -116,3 +118,53 @@ def log_with_timestamp(logger, message: str, level: str = "info"):
         logger.error(formatted_message)
     else:
         logger.info(formatted_message)
+
+
+def timestamp_print(message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}")
+
+
+def log_message(message, level="INFO"):
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    prefix = f"[{level.upper()}]"
+    log_line = f"[{timestamp}] {prefix} {message}"
+    try:
+        print(log_line)
+    except UnicodeEncodeError:
+        log_line = log_line.replace('✓', '[OK]').replace('✗', '[ERROR]')
+        print(log_line)
+
+
+def cleanup_duplicate_files(directory):
+    if not os.path.exists(directory):
+        return
+    file_groups = {}
+    for file in os.listdir(directory):
+        match = re.match(r'^(.*)\.(\d+)\.(.*)$', file)
+        if match:
+            base_name = match.group(1)
+            ext = match.group(3)
+            original_file = f"{base_name}.{ext}"
+            if original_file not in file_groups:
+                file_groups[original_file] = []
+            file_groups[original_file].append(file)
+    for original_file, duplicate_files in file_groups.items():
+        original_path = os.path.join(directory, original_file)
+        if os.path.exists(original_path):
+            for duplicate_file in duplicate_files:
+                duplicate_path = os.path.join(directory, duplicate_file)
+                try:
+                    os.remove(duplicate_path)
+                except Exception:
+                    pass
+
+
+def get_optimal_threads():
+    try:
+        import multiprocessing
+        cpu_count = multiprocessing.cpu_count()
+        optimal_threads = max(8, min(16, cpu_count * 2))
+        return optimal_threads
+    except Exception:
+        return 16

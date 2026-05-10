@@ -13,41 +13,13 @@ import requests
 import time
 from tqdm import tqdm
 
-# 强制使用 UTF-8 编码
-os.environ['PYTHONIOENCODING'] = 'utf-8'
+from utils.logger import log_message, cleanup_duplicate_files, get_optimal_threads
+from utils.download_utils import find_aria2c, check_aria2_available
 
-# 设置HF_ENDPOINT为HF-Mirror以加速模型下载
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-
-# 设置模型下载目录
 MODEL_DIR = os.path.join(os.getcwd(), "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# 本地 aria2 路径 - 尝试多个可能的位置
-ARIA2C_PATHS = [
-    # 当前目录
-    os.path.join(os.getcwd(), "aria2c.exe"),
-    # 常见的aria2目录结构
-    os.path.join(os.getcwd(), "aria2-1.37.0-win-64bit-build1", "aria2c.exe"),
-    os.path.join(os.getcwd(), "aria2", "aria2c.exe"),
-    os.path.join(os.getcwd(), "aria2", "aria2-1.37.0-win-64bit-build1", "aria2c.exe"),
-]
-
-# 找到第一个存在的 aria2c.exe
-ARIA2C_PATH = None
-
-# 首先检查预定义路径
-for path in ARIA2C_PATHS:
-    if os.path.exists(path):
-        ARIA2C_PATH = path
-        break
-
-# 如果未找到，搜索当前目录及其子目录
-if not ARIA2C_PATH:
-    for root, dirs, files in os.walk(os.getcwd()):
-        if "aria2c.exe" in files:
-            ARIA2C_PATH = os.path.join(root, "aria2c.exe")
-            break
+ARIA2C_PATH = find_aria2c()
 
 # 定义需要下载的模型
 MODELS = [
@@ -72,60 +44,6 @@ MODELS = [
     {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-persian", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-persian", "priority": "low", "type": "wav2vec2", "download": False}
 ]
 
-# 简化日志输出
-def log_message(message, level="INFO"):
-    """记录日志信息"""
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    prefix = f"[{level.upper()}]"
-    log_line = f"[{timestamp}] {prefix} {message}"
-    # 确保输出使用正确的编码
-    try:
-        print(log_line)
-    except UnicodeEncodeError:
-        # 替换Unicode字符为ASCII
-        log_line = log_line.replace('✓', '[OK]').replace('✗', '[ERROR]')
-        print(log_line)
-    # 同时将日志写入文件
-    with open("download_log.txt", "a", encoding="utf-8") as f:
-        f.write(log_line + "\n")
-
-# 检查本地 aria2 是否存在
-def check_aria2():
-    """检查本地 aria2 是否存在"""
-    global ARIA2C_PATH
-    
-    if ARIA2C_PATH and os.path.exists(ARIA2C_PATH):
-        try:
-            result = subprocess.run([ARIA2C_PATH, "--version"], capture_output=True, text=True)
-            if result.returncode == 0:
-                version = result.stdout.split('\n')[0]
-                log_message(f"[OK] 本地 aria2 可用: {version}")
-                log_message(f"  路径: {ARIA2C_PATH}")
-                return True
-        except Exception as e:
-            log_message(f"[ERROR] 本地 aria2 检查失败: {e}", "ERROR")
-    else:
-        log_message(f"[ERROR] 未找到本地 aria2", "ERROR")
-        log_message(f"  已搜索路径:")
-        for path in ARIA2C_PATHS:
-            log_message(f"    - {path}")
-    return False
-
-# 获取最佳线程数
-def get_optimal_threads():
-    """根据系统配置获取最佳线程数"""
-    try:
-        import multiprocessing
-        cpu_count = multiprocessing.cpu_count()
-        log_message(f"检测到CPU核心数: {cpu_count}")
-        optimal_threads = max(8, min(16, cpu_count * 2))
-        log_message(f"计算最佳线程数: {optimal_threads}")
-        return optimal_threads
-    except Exception as e:
-        log_message(f"获取线程数失败: {str(e)}", "ERROR")
-        return 16  # 默认使用16线程
-
-# 检查网络连接
 def check_internet_connection():
     """检查网络连接"""
     try:
@@ -134,46 +52,6 @@ def check_internet_connection():
     except:
         return False
 
-# 清理目录中的重复文件（带有数字后缀的文件）
-def cleanup_duplicate_files(directory):
-    """清理目录中的重复文件"""
-    if not os.path.exists(directory):
-        return
-    
-    log_message(f"清理目录中的重复文件: {directory}")
-    
-    import re
-    file_groups = {}
-    
-    for file in os.listdir(directory):
-        match = re.match(r'^(.*)\.(\d+)\.(.*)$', file)
-        if match:
-            base_name = match.group(1)
-            ext = match.group(3)
-            original_file = f"{base_name}.{ext}"
-            if original_file not in file_groups:
-                file_groups[original_file] = []
-            file_groups[original_file].append(file)
-    
-    deleted_count = 0
-    for original_file, duplicate_files in file_groups.items():
-        original_path = os.path.join(directory, original_file)
-        if os.path.exists(original_path):
-            for duplicate_file in duplicate_files:
-                duplicate_path = os.path.join(directory, duplicate_file)
-                log_message(f"删除重复文件: {duplicate_file}")
-                try:
-                    os.remove(duplicate_path)
-                    deleted_count += 1
-                except Exception as e:
-                    log_message(f"✗ 删除文件失败: {str(e)}", "ERROR")
-    
-    if deleted_count > 0:
-        log_message(f"[OK] 成功删除 {deleted_count} 个重复文件")
-    else:
-        log_message("[OK] 没有发现重复文件")
-
-# 检查模型完整性和版本兼容性
 def check_model(model_id, local_dir, model_type):
     """检查模型文件完整性和版本兼容性"""
     log_message(f"开始检查模型: {model_id}")
@@ -440,12 +318,11 @@ def download_model(model_info):
         if len(required_files) > 10:
             log_message(f"  ... 等 {len(required_files) - 10} 个文件")
         
-        # 检查是否使用aria2
-        use_aria2 = check_aria2()
+        use_aria2, aria2_msg = check_aria2_available(ARIA2C_PATH)
         if use_aria2:
-            log_message("使用aria2多线程下载模型")
+            log_message(f"使用aria2多线程下载模型: {aria2_msg}")
         else:
-            log_message("使用curl下载模型")
+            log_message(f"aria2不可用({aria2_msg})，使用curl下载模型")
         
         # 下载每个文件
         for file in required_files:

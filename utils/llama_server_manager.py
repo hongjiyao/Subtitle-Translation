@@ -12,18 +12,22 @@ import glob
 import signal
 from typing import Optional, Dict, Any
 
-from config import config, PROJECT_ROOT
+from config import config, ServerParams, PROJECT_ROOT
 
 
 class LlamaServerManager:
-    def __init__(self, system_prompt=None, port=None):
-        self.host = config.get('llama_server_host', '127.0.0.1')
-        self.port = port or config.get('llama_server_port', 8080)
-        self.context_size = config.get('llama_server_context_size', 8192)
-        self.threads = config.get('llama_server_threads', 8)
+    def __init__(self, system_prompt=None, port=None, server_params: ServerParams = None):
+        if server_params is None:
+            server_params = ServerParams()
+        self._server_params = server_params
+        self.host = server_params.host
+        self.port = port or server_params.port
+        self.context_size = server_params.ctx_size
+        self.threads = server_params.threads
         self.system_prompt = system_prompt
 
         self.process: Optional[subprocess.Popen] = None
+        self.pid = None
         self.server_path: Optional[str] = None
         self.model_path: Optional[str] = None
         self.fail_count = 0
@@ -137,16 +141,18 @@ class LlamaServerManager:
 
         self.stop_server()
 
+        ngl = self._server_params.ngl
+        batch_size = self._server_params.batch_size
         cmd = [
             self.server_path,
             "-m", self.model_path,
             "--host", self.host,
             "--port", str(self.port),
             "-c", str(self.context_size),
-            "-b", "2048",  # 设置批处理大小为2048
+            "-b", str(batch_size),
             "-t", str(self.threads),
-            "-ngl", "99",
-            "--no-mmap",  # 关闭内存映射
+            "-ngl", str(ngl),
+            "--no-mmap",
         ]
         
         # 添加系统提示词（如果提供）
@@ -164,7 +170,8 @@ class LlamaServerManager:
                 encoding='utf-8',
                 errors='ignore'
             )
-            time.sleep(3)
+            self.pid = self.process.pid
+            time.sleep(0.5)
 
             if self.process.poll() is not None:
                 stdout, stderr = self.process.communicate()
@@ -173,7 +180,7 @@ class LlamaServerManager:
                 print(f"[llama-server] 标准错误: {stderr[:500]}")
                 return False
 
-            for _ in range(10):
+            for _ in range(15):
                 if self._health_check():
                     self.fail_count = 0
                     print(f"[llama-server] 服务器已启动: {self.host}:{self.port}")
@@ -209,6 +216,7 @@ class LlamaServerManager:
             pass
 
         self.process = None
+        self.pid = None
 
     def ensure_server_running(self) -> bool:
         if self.is_server_running():

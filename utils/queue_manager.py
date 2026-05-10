@@ -3,33 +3,23 @@
 """队列管理器模块"""
 import os
 import time
-import datetime
 import gc
+import threading
 
-# 导入日志模块
-
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-os.environ["HUGGINGFACE_ENDPOINT"] = "https://hf-mirror.com"
-os.environ["TRANSFORMERS_OFFLINE"] = "0"
-os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
-os.environ["HF_HOME"] = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
+from utils.logger import timestamp_print as log
 
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-from config import MODEL_OPTIONS, TEMP_DIR, OUTPUT_DIR, config
+from config import MODEL_OPTIONS, TEMP_DIR, OUTPUT_DIR, config, VadParams, CdParams, TransParams, ServerParams
 from utils.video_processor import extract_audio
-from utils.speech_recognizer import recognize_speech, recognize_speech_enhanced, clear_model_cache
+from utils.speech_recognizer import recognize_speech_enhanced, clear_model_cache
 from utils.translator import translate_text, clear_translator_cache
 from utils.subtitle_generator import generate_subtitle, generate_translated_subtitle, generate_bilingual_subtitle
-from utils.punctuation_splitter import split_by_punctuation, ALL_SPLIT_PUNCTUATION
 
 VIDEO_EXTENSIONS = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.mpg', '.mpeg', '.ts']
 MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024
-
-def log(msg):
-    print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 def convert_numpy(obj):
     """将 numpy 类型转换为可序列化的 Python 类型"""
@@ -51,7 +41,19 @@ class QueueManager:
         self.video_queue = []
         self.processing = False
         self.logs = []
+        self._lock = threading.Lock()
+        self._cancel_flag = False
     
+    def cancel_processing(self):
+        self._cancel_flag = True
+        log("[队列] 收到取消请求")
+
+    def _check_cancelled(self):
+        if self._cancel_flag:
+            self._cancel_flag = False
+            return True
+        return False
+
     def add_log(self, msg):
         if msg and isinstance(msg, str):
             self.logs.append(msg)
@@ -92,14 +94,15 @@ class QueueManager:
         files = [f for f in processed if f][:50 - len(self.video_queue)]
         
         count = 0
-        for f in files:
-            valid, err = self._validate_file(f)
-            if not valid:
-                log(f"[警告] {err}")
-                continue
-            self.video_queue.append({'file_path': f, 'filename': os.path.basename(f), 'status': '等待中', 'params': params})
-            count += 1
-            log(f"[成功] 添加: {f}")
+        with self._lock:
+            for f in files:
+                valid, err = self._validate_file(f)
+                if not valid:
+                    log(f"[警告] {err}")
+                    continue
+                self.video_queue.append({'file_path': f, 'filename': os.path.basename(f), 'status': '等待中', 'params': params})
+                count += 1
+                log(f"[成功] 添加: {f}")
         
         log(f"[队列] 已添加 {count} 个文件")
         return count
@@ -110,16 +113,18 @@ class QueueManager:
             return
         try:
             idx = int(idx.strip() if isinstance(idx, str) else idx)
-            if 0 <= idx < len(self.video_queue):
-                log(f"[成功] 删除: {self.video_queue[idx]['filename']}")
-                self.video_queue.pop(idx)
+            with self._lock:
+                if 0 <= idx < len(self.video_queue):
+                    log(f"[成功] 删除: {self.video_queue[idx]['filename']}")
+                    self.video_queue.pop(idx)
         except Exception as e:
             log(f"[错误] 删除失败: {e}")
     
     def clear_queue(self):
         log(f"\n{'='*80}\n[队列] 清空")
-        count = len(self.video_queue)
-        self.video_queue = []
+        with self._lock:
+            count = len(self.video_queue)
+            self.video_queue = []
         log(f"[成功] 清空 {count} 个文件")
         return count
     
@@ -130,6 +135,7 @@ class QueueManager:
         gc.collect()
     
     def process_video(self, video_file, params):
+        temp_files = []
         try:
             if not video_file or not os.path.exists(video_file):
                 return False, "文件不存在", None, []
@@ -148,6 +154,10 @@ class QueueManager:
             output_path = params.get('output_path') or os.path.join(OUTPUT_DIR, f"{os.path.splitext(os.path.basename(video_file))[0]}_subtitles.srt")
             src_lang = params.get('source_language', 'auto')
             tgt_lang = params.get('target_language', 'zh')
+            vad_params = VadParams.from_dict(params)
+            cd_params = CdParams.from_dict(params)
+            trans_params = TransParams.from_dict(params)
+            server_params = ServerParams.from_dict(params)
             
             self.add_log(f"开始处理: {video_file}")
             os.makedirs(TEMP_DIR, exist_ok=True)
@@ -157,9 +167,14 @@ class QueueManager:
             self.add_log("1. 提取音频...")
             start = time.time()
             audio_path = extract_audio(video_file)
+            temp_files.append(audio_path)
             self.add_log(f"音频提取完成，耗时: {time.time() - start:.2f}s")
             self._cleanup(params['device'])
-            
+
+            if self._check_cancelled():
+                self.add_log("处理已被用户取消")
+                return False, "处理已取消", None, self.logs
+
             # 2. 语音识别（使用增强版）
             log("[阶段] 2. 语音识别")
             self.add_log("2. 语音识别...")
@@ -169,23 +184,22 @@ class QueueManager:
             
             # 使用增强版语音识别函数，支持强制对齐和标点还原
             self.add_log("使用增强版语音识别（强制对齐+标点还原）...")
+
+            def recognition_progress_callback(progress, message=""):
+                if message:
+                    self.add_log(f"语音识别: {message}")
+                elif isinstance(progress, (int, float)):
+                    self.add_log(f"语音识别进度: {int(progress)}%")
+
             recognized = recognize_speech_enhanced(
                 audio_path, params['model'],
                 detected_language=None if src_lang == 'auto' else src_lang,
                 device_choice=params['device'],
-                progress_callback=None,
-                word_timestamps=params.get('word_timestamps', True),
-                vad_threshold=params.get('vad_threshold', 0.4),
-                min_speech_duration=params.get('vad_min_speech_duration', 1.0),
-                max_speech_duration=params.get('vad_max_speech_duration', 30.0),
-                min_silence_duration=params.get('vad_min_silence_duration', 1.0),
-                speech_pad_ms=params.get('vad_speech_pad_ms', 300),
-                prefix_padding_ms=params.get('vad_prefix_padding_ms', 50),
-                use_max_poss_sil_at_max_speech=params.get('use_max_poss_sil_at_max_speech', True),
-                enable_alignment=params.get('enable_forced_alignment', True),
-                enable_whispercd=params.get('enable_whispercd', True),
-                enable_punctuate=params.get('enable_punctuate', True),
-                neg_threshold=params.get('vad_neg_threshold', None)
+                progress_callback=recognition_progress_callback,
+                word_timestamps=True,
+                vad_params=vad_params,
+                cd_params=cd_params,
+                enable_alignment=params.get('enable_forced_alignment', True)
             )
             
             self.add_log(f"语音识别完成，语言: {recognized['language']}")
@@ -193,14 +207,13 @@ class QueueManager:
                 seg_count = len(recognized.get('segments', []))
                 self.add_log(f"生成 {seg_count} 个对齐段落")
             
+            recognized_serializable = convert_numpy(recognized)
+            
             # 保存强制对齐后的语音识别结果到输出文件夹
             try:
                 base_name = os.path.splitext(os.path.basename(video_file))[0]
                 aligned_recognition_path = os.path.join(OUTPUT_DIR, f"{base_name}_aligned_recognition.json")
                 import json
-                # 转换 numpy 类型为可序列化的 Python 类型
-                recognized_serializable = convert_numpy(recognized)
-                # 移除 original_logits 以节省空间（递归处理）
                 def remove_logits_recursive(obj):
                     if isinstance(obj, dict):
                         obj.pop('original_logits', None)
@@ -210,7 +223,7 @@ class QueueManager:
                         for item in obj:
                             remove_logits_recursive(item)
                     return obj
-                recognized_for_save = remove_logits_recursive(convert_numpy(recognized))
+                recognized_for_save = remove_logits_recursive(recognized_serializable)
                 with open(aligned_recognition_path, 'w', encoding='utf-8') as f:
                     json.dump(recognized_for_save, f, ensure_ascii=False, indent=2)
                 self.add_log(f"强制对齐后的语音识别结果已保存: {aligned_recognition_path}")
@@ -220,100 +233,37 @@ class QueueManager:
             clear_model_cache()
             self._cleanup(params['device'])
 
-            # 断句处理：使用标点符号进行断句，并使用字符级别时间戳精确计算时间
-            log("[阶段] 2.5 断句处理")
-            self.add_log("2.5 断句处理...")
-
-            all_new_segments = []
-            for segment in recognized_serializable.get('segments', []):
-                text = segment.get("text", "").strip()
-                if not text:
-                    continue
-
-                # 跳过短于20字符的片段
-                if len(text) < 20:
-                    all_new_segments.append(segment)
-                    continue
-
-                # 获取字符级别的时间戳信息（不包含标点符号）
-                chars_info = segment.get("chars", [])
-
-                # 构建字符列表及其时间戳和序号（chars_info中的序号）
-                char_list = []
-                for idx, char_info in enumerate(chars_info):
-                    char_text = char_info.get("char", "")
-                    # 排除标点符号
-                    if char_text not in ALL_SPLIT_PUNCTUATION:
-                        start_time = char_info.get("start", 0.0)
-                        end_time = char_info.get("end", 0.0)
-                        char_list.append({
-                            "char": char_text,
-                            "start": start_time,
-                            "end": end_time,
-                            "idx": idx  # 在chars_info中的序号
-                        })
-
-                # 使用标点分割器进行断句
-                sentences = split_by_punctuation(text)
-                seg_start = segment.get("start", 0.0)
-                seg_end = segment.get("end", 0.0)
-
-                for sentence_info in sentences:
-                    sentence = sentence_info['text'].strip()
-                    # 过滤掉只包含标点符号或非标点字符少于2个的无效句子
-                    non_punct_chars = [c for c in sentence if c not in ALL_SPLIT_PUNCTUATION]
-                    if len(non_punct_chars) < 2:
-                        continue
-                    # 获取句子在原文中的字符位置范围
-                    sent_start_pos = sentence_info['start']
-                    sent_end_pos = sentence_info['end']
-
-                    # 计算句子时间戳
-                    # 使用线性比例计算，基于sentence在text中的位置
-                    # 不再使用字级时间戳，简化计算逻辑
-                    text_length = len(text)
-                    seg_duration = seg_end - seg_start
-
-                    # sent_start_pos是sentence在text中的开始位置（字符索引）
-                    # sent_end_pos是sentence在text中的结束位置（字符索引）
-                    start_ratio = sent_start_pos / text_length if text_length > 0 else 0
-                    end_ratio = sent_end_pos / text_length if text_length > 0 else 1
-
-                    # 计算时间戳，使用segment的时间范围作为基础
-                    sentence_start = seg_start + seg_duration * start_ratio
-                    sentence_end = seg_start + seg_duration * end_ratio
-
-                    all_new_segments.append({
-                        "text": sentence,
-                        "start": sentence_start,
-                        "end": sentence_end
-                    })
-
-            # 更新recognized_serializable的segments
-            recognized_serializable['segments'] = all_new_segments
-            self.add_log(f"断句处理完成，共 {len(all_new_segments)} 个片段")
+            if self._check_cancelled():
+                self.add_log("处理已被用户取消")
+                return False, "处理已取消", None, self.logs
 
             # 3. 翻译
             translated = recognized_serializable
             if recognized_serializable['language'] != tgt_lang:
                 log("[阶段] 3. 翻译")
                 self.add_log("3. 翻译...")
+
+                def translation_progress_callback(progress):
+                    if isinstance(progress, (int, float)):
+                        self.add_log(f"翻译进度: {int(progress)}%")
+
                 try:
                     translated = translate_text(
                         recognized_serializable, translator, device_choice=params['device'],
                         target_language=tgt_lang,
-                        batch_size=params.get('translation_batch_size', 3500),
-                        context_size=params.get('translation_context_size', 8192)
+                        trans_params=trans_params,
+                        progress_callback=translation_progress_callback
                     )
                     self.add_log("翻译完成")
                 except Exception as e:
                     if "out of memory" in str(e).lower():
                         self.add_log("[内存] 不足，减小token限制重试")
+                        half_batch_params = TransParams.from_dict(params)
+                        half_batch_params.batch_size = half_batch_params.batch_size // 2
                         translated = translate_text(
                             recognized_serializable, translator, device_choice=params['device'],
                             target_language=tgt_lang,
-                            batch_size=params.get('translation_batch_size', 3500) // 2,
-                            context_size=params.get('translation_context_size', 8192)
+                            trans_params=half_batch_params
                         )
                     else:
                         raise
@@ -322,6 +272,10 @@ class QueueManager:
             
             clear_translator_cache()
             self._cleanup(params['device'])
+
+            if self._check_cancelled():
+                self.add_log("处理已被用户取消")
+                return False, "处理已取消", None, self.logs
             
             # 4. 生成字幕
             log("[阶段] 4. 生成字幕")
@@ -330,7 +284,7 @@ class QueueManager:
             # 生成原文版本字幕
             original_subtitle_path = os.path.join(OUTPUT_DIR, f"{os.path.splitext(os.path.basename(video_file))[0]}_original_subtitles.srt")
             generate_subtitle(
-                recognized, 
+                recognized_serializable, 
                 original_subtitle_path
             )
             self.add_log(f"原文字幕生成完成: {original_subtitle_path}")
@@ -353,16 +307,6 @@ class QueueManager:
             
             self.add_log(f"字幕生成完成，总耗时: {time.time() - start:.2f}s")
             
-            # 清理临时文件
-            if os.path.exists(TEMP_DIR):
-                for f in os.listdir(TEMP_DIR):
-                    try:
-                        os.remove(os.path.join(TEMP_DIR, f))
-                    except:
-                        pass
-            self._cleanup(params['device'])
-            
-            # 收集所有生成的字幕文件
             all_outputs = [original_subtitle_path, translated_subtitle_path, bilingual_subtitle_path]
             all_outputs = [f for f in all_outputs if os.path.exists(f)]
             
@@ -374,8 +318,15 @@ class QueueManager:
             import traceback
             log(f"[错误] 处理失败: {e}\n{traceback.format_exc()}")
             self.add_log(f"处理失败: {e}")
-            self._cleanup(params.get('device', 'cpu'))
             return False, f"处理错误: {e}", None, self.logs
+        finally:
+            for f in temp_files:
+                try:
+                    if os.path.exists(f):
+                        os.remove(f)
+                except Exception:
+                    pass
+            self._cleanup(params.get('device', 'cpu'))
     
     def process_queue(self):
         log(f"\n{'='*80}\n[队列] 开始处理，共 {len(self.video_queue)} 个文件")
@@ -389,18 +340,25 @@ class QueueManager:
             return
         
         self.processing = True
+        self._cancel_flag = False
         
         try:
             for i, item in enumerate(self.video_queue):
-                self.video_queue[i]['status'] = '处理中'
+                with self._lock:
+                    self.video_queue[i]['status'] = '处理中'
                 log(f"[队列] 处理第 {i+1}/{len(self.video_queue)} 个: {item['filename']}")
                 yield [[j['filename'], j['status']] for j in self.video_queue], "", "", 0, ""
                 
                 self.logs = []
                 success, msg, output, logs = self.process_video(item['file_path'], item['params'])
                 log(f"[队列] 结果: {msg}")
-                
-                self.video_queue[i]['status'] = '已完成' if success else '失败'
+
+                if self._cancel_flag:
+                    self._cancel_flag = False
+                    break
+
+                with self._lock:
+                    self.video_queue[i]['status'] = '已完成' if success else '失败'
                 yield [[j['filename'], j['status']] for j in self.video_queue], "", "\n".join(logs), 100, ""
                 
                 gc.collect()
