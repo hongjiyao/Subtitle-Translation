@@ -5,12 +5,27 @@
 """
 
 import os
+import re
 import json
-from typing import Dict, Any, List, Tuple, Optional
+import threading
+from typing import Dict, Any, List, Tuple, Optional, ClassVar
 from dataclasses import dataclass, fields
 
+def _detect_package_mode():
+    _current_dir = os.path.dirname(os.path.abspath(__file__))
+    _parent_dir = os.path.dirname(_current_dir)
+    return os.path.isfile(os.path.join(_parent_dir, "python", "python.exe"))
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+IS_PACKAGE_MODE = _detect_package_mode()
+
+if IS_PACKAGE_MODE:
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _python_dir = os.path.join(PROJECT_ROOT, "python")
+    if hasattr(os, 'add_dll_directory'):
+        os.add_dll_directory(_python_dir)
+else:
+    PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
 MODEL_CACHE_DIR = os.path.join(PROJECT_ROOT, "models")
 TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")
@@ -29,33 +44,11 @@ os.environ.setdefault('HUGGINGFACE_HUB_CACHE', MODEL_CACHE_DIR)
 
 
 @dataclass
-class VadParams:
-    threshold: float = 0.5
-    min_speech: float = 0.5
-    max_speech: float = 30.0
-    min_silence: float = 0.5
-    speech_pad_ms: int = 400
-    prefix_padding_ms: int = 30
-    neg_threshold: float = 0.1
-    max_sil_split: bool = True
-    max_sil_dur: int = 98
-    resolution: int = 1
-
-    _KEY_MAP = {
-        'threshold': 'vad_threshold',
-        'min_speech': 'vad_min_speech_duration',
-        'max_speech': 'vad_max_speech_duration',
-        'min_silence': 'vad_min_silence_duration',
-        'speech_pad_ms': 'vad_speech_pad_ms',
-        'prefix_padding_ms': 'vad_prefix_padding_ms',
-        'neg_threshold': 'vad_neg_threshold',
-        'max_sil_split': 'use_max_poss_sil_at_max_speech',
-        'max_sil_dur': 'vad_min_silence_at_max_speech',
-        'resolution': 'vad_time_resolution',
-    }
+class ParamBase:
+    _KEY_MAP: ClassVar[Dict[str, str]] = {}
 
     @classmethod
-    def from_dict(cls, params: Dict[str, Any]) -> 'VadParams':
+    def from_dict(cls, params):
         kwargs = {}
         for f in fields(cls):
             if f.name.startswith('_'):
@@ -66,55 +59,49 @@ class VadParams:
         return cls(**kwargs)
 
 
-@dataclass
-class CdParams:
-    alpha: float = 1.0
-    temperature: float = 1.0
-    snr_db: float = 10.0
-    temporal_shift: float = 7.0
-    ctx_tokens: int = 200
 
-    _KEY_MAP = {
+@dataclass
+class CdParams(ParamBase):
+    alpha: float = 1.0                    # Whisper-CD 对比强度参数，值越大对比解码影响越强，范围 [0.0, 2.0]
+    temperature: float = 1.0              # Whisper-CD log-sum-exp 温度参数，控制扰动 logits 的聚合平滑度，范围 [0.1, 5.0]
+    snr_db: float = 10.0                  # Whisper-CD 高斯噪声注入的信噪比（dB），值越高噪声越小，范围 [0.0, 30.0]
+    temporal_shift: float = 7.0           # Whisper-CD 音频时间移位的秒数，用于生成时间扰动负样本，范围 [0.0, 15.0]
+    ctx_tokens: int = 200                 # Whisper-CD 上下文最大字符数，范围 [64, 400]
+    max_duration: float = 4.0             # 字幕分段最大时长（秒），超过此时长的片段将被分割，范围 [2.0, 15.0]
+    min_duration: float = 3.0             # 字幕合并最小时长（秒），低于此时长的片段将被合并，范围 [1.0, 10.0]
+    gap_threshold: float = 2.0           # 跨chunk边界合并的最大间隔（秒），间隔小于此值且语义连续时合并，范围 [0.5, 5.0]
+    particle_chars: str = "てにをはがのともへでかよねば"  # 三级分割自然断点字符，用于无标点时长片段的分割
+
+    _KEY_MAP: ClassVar[Dict[str, str]] = {
         'alpha': 'whispercd_alpha',
         'temperature': 'whispercd_temperature',
         'snr_db': 'whispercd_snr_db',
         'temporal_shift': 'whispercd_temporal_shift',
         'ctx_tokens': 'whispercd_context_max_tokens',
+        'max_duration': 'whispercd_max_duration',
+        'min_duration': 'whispercd_min_duration',
+        'gap_threshold': 'whispercd_gap_threshold',
+        'particle_chars': 'whispercd_particle_chars',
     }
-
-    @classmethod
-    def from_dict(cls, params: Dict[str, Any]) -> 'CdParams':
-        kwargs = {}
-        for f in fields(cls):
-            if f.name.startswith('_'):
-                continue
-            key = cls._KEY_MAP.get(f.name, f.name)
-            if key in params:
-                kwargs[f.name] = params[key]
-        return cls(**kwargs)
 
 
 @dataclass
-class TransParams:
-    temperature: float = 0.2
-    top_k: int = 20
-    top_p: float = 0.6
-    rep_penalty: float = 1.05
-    batch_size: int = 2000
-    ctx_size: int = 8192
-    seg_ctx_window: int = 6
-    max_retries: int = 3
-    max_total_retries: int = 10
-    max_output_tokens: int = 8000
-    reset_session: bool = True
+class TransParams(ParamBase):
+    temperature: float = 0.1               # 翻译模型采样温度，值越低输出越确定，值越高越多样，范围 [0.0, 2.0]
+    top_k: int = 20                        # 翻译模型 Top-K 采样参数，限制候选 token 数量，范围 [1, 100]
+    top_p: float = 0.6                     # 翻译模型 Top-P 核采样参数，限制累积概率阈值，范围 [0.0, 1.0]
+    rep_penalty: float = 1.05              # 翻译模型重复惩罚参数，值大于 1 抑制重复生成，范围 [1.0, 2.0]
+    seg_ctx_window: int = 3                # 翻译时读取前后片段的数量，用于提供上下文信息，范围 [0, 20]
+    max_retries: int = 3                   # 翻译单条最大重试次数，超过后使用原文，范围 [1, 10]
+    max_total_retries: int = 3            # 翻译验证失败最大总重试次数，超过后使用原文，范围 [3, 30]
+    max_output_tokens: int = 512           # 翻译最大输出 token 数，限制单次翻译输出长度，范围 [64, 4096]
+    reset_session: bool = False            # 是否在每次翻译前重置 llama-server 会话，确保翻译一致性
 
-    _KEY_MAP = {
+    _KEY_MAP: ClassVar[Dict[str, str]] = {
         'temperature': 'translation_temperature',
         'top_k': 'translation_top_k',
         'top_p': 'translation_top_p',
         'rep_penalty': 'translation_repetition_penalty',
-        'batch_size': 'translation_batch_size',
-        'ctx_size': 'translation_context_size',
         'seg_ctx_window': 'translation_segment_context_window',
         'max_retries': 'translation_max_retries',
         'max_total_retries': 'translation_max_total_retries',
@@ -122,46 +109,28 @@ class TransParams:
         'reset_session': 'translation_reset_session',
     }
 
-    @classmethod
-    def from_dict(cls, params: Dict[str, Any]) -> 'TransParams':
-        kwargs = {}
-        for f in fields(cls):
-            if f.name.startswith('_'):
-                continue
-            key = cls._KEY_MAP.get(f.name, f.name)
-            if key in params:
-                kwargs[f.name] = params[key]
-        return cls(**kwargs)
-
 
 @dataclass
-class ServerParams:
-    host: str = "127.0.0.1"
-    port: int = 8080
-    ctx_size: int = 8192
-    threads: int = 8
-    ngl: int = 99
-    batch_size: int = 2048
+class ServerParams(ParamBase):
+    host: str = "127.0.0.1"                # llama-server 监听地址，通常为 127.0.0.1
+    port: int = 8080                        # llama-server 监听端口，范围 [1, 65535]
+    ctx_size: int = 4096                    # llama-server 上下文窗口大小，限制单次请求的 prompt+输出总 token 数，范围 [512, 32768]
+    threads: int = 8                        # llama-server CPU 线程数，范围 [1, 128]
+    ngl: int = 99                           # llama-server GPU 卸载层数，0 表示仅 CPU，99 表示全部卸载到 GPU，范围 [0, 999]
+    batch_size: int = 512                  # llama-server 批处理大小，影响推理速度和显存占用，范围 [512, 8192]
+    parallel_slots: int = 1                 # llama-server 并行处理槽数，单用户建议设为1以释放VRAM提升速度，范围 [1, 8]
+    quantization: str = "Q8_0"              # 翻译模型量化版本，仅支持 Q8_0
 
-    _KEY_MAP = {
+    _KEY_MAP: ClassVar[Dict[str, str]] = {
         'host': 'llama_server_host',
         'port': 'llama_server_port',
         'ctx_size': 'llama_server_context_size',
         'threads': 'llama_server_threads',
         'ngl': 'llama_server_ngl',
         'batch_size': 'llama_server_batch_size',
+        'parallel_slots': 'llama_server_parallel_slots',
+        'quantization': 'translator_quantization',
     }
-
-    @classmethod
-    def from_dict(cls, params: Dict[str, Any]) -> 'ServerParams':
-        kwargs = {}
-        for f in fields(cls):
-            if f.name.startswith('_'):
-                continue
-            key = cls._KEY_MAP.get(f.name, f.name)
-            if key in params:
-                kwargs[f.name] = params[key]
-        return cls(**kwargs)
 
 
 PARAM_DEFINITIONS: Dict[str, Dict[str, Any]] = {
@@ -171,17 +140,17 @@ PARAM_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "Whisper 语音识别模型名称，影响识别精度和速度"
     },
     "translator": {
-        "default": "tencent/HY-MT1.5-7B-GGUF",
-        "options": ["tencent/HY-MT1.5-7B-GGUF"],
-        "description": "翻译模型标识，目前仅支持 tencent/HY-MT1.5-7B-GGUF"
+        "default": "tencent/HY-MT1.5-1.8B-GGUF",
+        "options": ["tencent/HY-MT1.5-1.8B-GGUF"],
+        "description": "翻译模型标识，目前仅支持 tencent/HY-MT1.5-1.8B-GGUF"
     },
     "translator_quantization": {
-        "default": "Q4_K_M",
-        "options": ["auto", "Q4_K_M", "Q6_K", "Q8_0"],
-        "description": "翻译模型量化版本，auto 自动选择最小可用模型"
+        "default": "Q8_0",
+        "options": ["Q8_0"],
+        "description": "翻译模型量化版本，仅支持 Q8_0"
     },
     "device": {
-        "default": "auto",
+        "default": "cuda",
         "options": ["auto", "cuda", "cpu"],
         "description": "计算设备选择，auto 自动检测 CUDA 可用性"
     },
@@ -194,55 +163,6 @@ PARAM_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "default": "zh",
         "options": ["zh", "en", "ja", "ko", "fr", "de", "es", "ru", "ar", "hi", "pt", "it", "nl", "pl"],
         "description": "目标语言（翻译输出语言）"
-    },
-    "vad_threshold": {
-        "default": 0.02,
-        "range": [0.0, 1.0],
-        "description": "VAD 语音活动检测概率阈值，值越高要求越确定才判定为语音"
-    },
-    "vad_min_speech_duration": {
-        "default": 0.5,
-        "range": [0.01, 10.0],
-        "description": "VAD 最短语音持续时间（秒），短于此值的片段被过滤"
-    },
-    "vad_max_speech_duration": {
-        "default": 30.0,
-        "range": [1.0, 300.0],
-        "description": "VAD 最长语音持续时间（秒），超长片段会被强制分割"
-    },
-    "vad_min_silence_duration": {
-        "default": 0.2,
-        "range": [0.01, 10.0],
-        "description": "VAD 最短静默持续时间（秒），用于分割相邻语音片段"
-    },
-    "vad_speech_pad_ms": {
-        "default": 0,
-        "range": [0, 5000],
-        "description": "VAD 语音片段前后填充时间（毫秒），避免边缘截断"
-    },
-    "vad_prefix_padding_ms": {
-        "default": 300,
-        "range": [0, 5000],
-        "description": "VAD 前缀填充时间（毫秒），在每个语音片段开头添加额外音频"
-    },
-    "vad_neg_threshold": {
-        "default": 0.01,
-        "range": [0.0, 1.0],
-        "description": "VAD 静音判定阈值，低于此值判定为静音，用于语音片段结束检测"
-    },
-    "use_max_poss_sil_at_max_speech": {
-        "default": True,
-        "description": "VAD 在最长语音片段中是否优先使用最长静音点进行分割"
-    },
-    "vad_min_silence_at_max_speech": {
-        "default": 98,
-        "range": [0, 1000],
-        "description": "VAD 长语音分割时最大片段内静音时长（毫秒），用于避免强制分割时的突兀截断"
-    },
-    "vad_time_resolution": {
-        "default": 1,
-        "range": [1, 1000],
-        "description": "VAD 时间分辨率（毫秒），控制语音时间戳的精度"
     },
     "whispercd_alpha": {
         "default": 1.0,
@@ -269,27 +189,36 @@ PARAM_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "range": [64, 400],
         "description": "Whisper-CD 上下文最大字符数（实际 token 数可能更多，超限时自动截断至 token 预算内）"
     },
+    "whispercd_max_duration": {
+        "default": 4.0,
+        "range": [2.0, 15.0],
+        "description": "字幕分段最大时长（秒），超过此时长的片段将被分割"
+    },
+    "whispercd_min_duration": {
+        "default": 3.0,
+        "range": [1.0, 10.0],
+        "description": "字幕合并最小时长（秒），低于此时长的片段将被合并"
+    },
+    "whispercd_gap_threshold": {
+        "default": 2.0,
+        "range": [0.5, 5.0],
+        "description": "跨chunk边界合并的最大间隔（秒），间隔小于此值且语义连续时合并"
+    },
+    "whispercd_particle_chars": {
+        "default": "てにをはがのともへでかよねば",
+        "description": "三级分割自然断点字符，用于无标点时长片段的分割。日语助词如：てにをはがのともへでかよねば；中文可填：的了是在不和有这"
+    },
     "enable_forced_alignment": {
         "default": True,
         "description": "是否启用 Wav2Vec2 强制对齐，获取字符级和词级精确时间戳"
     },
-    "translation_batch_size": {
-        "default": 2000,
-        "range": [1024, 8192],
-        "description": "翻译批处理大小（基于 token 数），影响单次翻译的文本量"
-    },
-    "translation_context_size": {
-        "default": 4096,
-        "range": [1024, 32768],
-        "description": "翻译模型上下文窗口大小，限制单次翻译可用的总 token 数"
-    },
     "translation_segment_context_window": {
-        "default": 6,
+        "default": 3,
         "range": [0, 20],
         "description": "翻译时读取前后片段的数量，用于提供上下文信息"
     },
     "translation_temperature": {
-        "default": 0.2,
+        "default": 0.1,
         "range": [0.0, 2.0],
         "description": "翻译模型采样温度，值越低输出越确定，值越高越多样"
     },
@@ -318,7 +247,7 @@ PARAM_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "llama-server 监听端口"
     },
     "llama_server_context_size": {
-        "default": 8192,
+        "default": 4096,
         "range": [512, 32768],
         "description": "llama-server 上下文窗口大小，限制单次请求的 prompt+输出总 token 数"
     },
@@ -328,7 +257,7 @@ PARAM_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "llama-server CPU 线程数"
     },
     "translation_reset_session": {
-        "default": True,
+        "default": False,
         "description": "是否在每次翻译前重置 llama-server 会话，确保翻译一致性"
     },
     "llama_server_ngl": {
@@ -337,9 +266,14 @@ PARAM_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "llama-server GPU 卸载层数，0 表示仅 CPU，99 表示全部卸载到 GPU"
     },
     "llama_server_batch_size": {
-        "default": 2048,
+        "default": 512,
         "range": [512, 8192],
         "description": "llama-server 批处理大小，影响推理速度和显存占用"
+    },
+    "llama_server_parallel_slots": {
+        "default": 1,
+        "range": [1, 8],
+        "description": "llama-server 并行处理槽数，单用户建议设为1以释放VRAM提升速度"
     },
     "translation_max_retries": {
         "default": 3,
@@ -347,13 +281,13 @@ PARAM_DEFINITIONS: Dict[str, Dict[str, Any]] = {
         "description": "翻译单条最大重试次数，超过后使用原文"
     },
     "translation_max_total_retries": {
-        "default": 10,
+        "default": 3,
         "range": [3, 30],
         "description": "翻译验证失败最大总重试次数，超过后使用原文"
     },
     "translation_max_output_tokens": {
-        "default": 8000,
-        "range": [1024, 32768],
+        "default": 512,
+        "range": [64, 4096],
         "description": "翻译最大输出 token 数，限制单次翻译输出长度"
     },
 }
@@ -370,18 +304,23 @@ def _get_type(value: Any) -> type:
         return int
     if isinstance(value, float):
         return float
+    if value is None:
+        return float
     return str
 
 
 class ConfigManager:
     _instance = None
+    _lock = threading.Lock()
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._data = _get_default_config()
-            cls._instance._errors = []
-            cls._instance._load()
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._data = _get_default_config()
+                    cls._instance._errors = []
+                    cls._instance._load()
         return cls._instance
 
     @staticmethod
@@ -446,6 +385,17 @@ class ConfigManager:
                         print(f"[配置警告] {msg}，已重置为默认值: {default_value}")
         return len(self._errors) == 0
 
+    def _validate_dependencies(self) -> Tuple[bool, str]:
+        ctx_size = self._data.get("llama_server_context_size", 0)
+        trans_output = self._data.get("translation_max_output_tokens", 0)
+        batch_size = self._data.get("llama_server_batch_size", 0)
+
+        if trans_output > ctx_size:
+            return False, f"translation_max_output_tokens({trans_output}) 不能大于 llama_server_context_size({ctx_size})"
+        if batch_size > ctx_size:
+            return False, f"llama_server_batch_size({batch_size}) 不能大于 llama_server_context_size({ctx_size})"
+        return True, ""
+
     def _load(self):
         if not os.path.exists(CONFIG_FILE):
             return
@@ -453,8 +403,13 @@ class ConfigManager:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 user_data = json.load(f)
             loaded_count = 0
-            for key in self._data:
-                if key in user_data:
+            cleaned = False
+            for key in user_data:
+                if key not in PARAM_DEFINITIONS:
+                    print(f"配置文件中存在未知参数: {key}，已自动清理")
+                    cleaned = True
+                    continue
+                if key in self._data:
                     definition = PARAM_DEFINITIONS.get(key)
                     if definition:
                         valid, msg = self._validate_param(key, user_data[key], definition)
@@ -463,6 +418,9 @@ class ConfigManager:
                             loaded_count += 1
                         else:
                             print(f"[配置警告] {msg}，使用默认值")
+            if cleaned:
+                self.save()
+                print("[配置] 已自动清理配置文件中的未知参数")
             print(f"[配置] 已加载 {loaded_count} 个自定义参数")
             self._validate_all()
         except json.JSONDecodeError as e:
@@ -479,11 +437,19 @@ class ConfigManager:
     def set(self, key: str, value: Any) -> Tuple[bool, str]:
         if key not in self._data:
             return False, f"未知配置项: {key}"
+        if key == "llama_server_host":
+            if not isinstance(value, str) or not re.match(r'^[\w.\-]+$', value):
+                return False, "无效的主机地址"
         definition = PARAM_DEFINITIONS.get(key)
         if definition:
             valid, msg = self._validate_param(key, value, definition)
             if not valid:
                 return False, msg
+            expected_type = _get_type(definition["default"])
+            if expected_type == int and isinstance(value, float) and value == int(value):
+                value = int(value)
+            elif expected_type == float and isinstance(value, int):
+                value = float(value)
         self._data[key] = value
         return True, f"已设置 {key} = {value}"
 
@@ -494,6 +460,9 @@ class ConfigManager:
                     valid, msg = self.set(key, value)
                     if not valid:
                         return False, msg
+            valid, msg = self._validate_dependencies()
+            if not valid:
+                return False, msg
             defaults = _get_default_config()
             to_save = {k: v for k, v in self._data.items() if k in defaults}
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -524,46 +493,6 @@ class ConfigManager:
 
     def is_valid(self) -> bool:
         return len(self._errors) == 0
-
-    def ui_values(self) -> Dict[str, Any]:
-        return {
-            "model": self._data.get('model'),
-            "device": self._data.get('device'),
-            "source_language": self._data.get('source_language'),
-            "target_language": self._data.get('target_language'),
-            "vad_threshold": self._data.get('vad_threshold'),
-            "vad_min_speech_duration": self._data.get('vad_min_speech_duration'),
-            "vad_max_speech_duration": self._data.get('vad_max_speech_duration'),
-            "vad_min_silence_duration": self._data.get('vad_min_silence_duration'),
-            "vad_speech_pad_ms": self._data.get('vad_speech_pad_ms'),
-            "vad_prefix_padding_ms": self._data.get('vad_prefix_padding_ms'),
-            "vad_neg_threshold": self._data.get('vad_neg_threshold'),
-            "use_max_poss_sil_at_max_speech": self._data.get('use_max_poss_sil_at_max_speech'),
-            "vad_min_silence_at_max_speech": self._data.get('vad_min_silence_at_max_speech'),
-            "vad_time_resolution": self._data.get('vad_time_resolution'),
-            "enable_forced_alignment": self._data.get('enable_forced_alignment'),
-            "translation_batch_size": self._data.get('translation_batch_size'),
-            "translation_context_size": self._data.get('translation_context_size'),
-            "translation_segment_context_window": self._data.get('translation_segment_context_window'),
-            "translation_temperature": self._data.get('translation_temperature'),
-            "translation_top_k": self._data.get('translation_top_k'),
-            "translation_top_p": self._data.get('translation_top_p'),
-            "translation_repetition_penalty": self._data.get('translation_repetition_penalty'),
-            "translation_max_retries": self._data.get('translation_max_retries'),
-            "translation_max_total_retries": self._data.get('translation_max_total_retries'),
-            "translation_max_output_tokens": self._data.get('translation_max_output_tokens'),
-            "llama_server_host": self._data.get('llama_server_host'),
-            "llama_server_port": self._data.get('llama_server_port'),
-            "llama_server_context_size": self._data.get('llama_server_context_size'),
-            "llama_server_threads": self._data.get('llama_server_threads'),
-            "llama_server_ngl": self._data.get('llama_server_ngl'),
-            "llama_server_batch_size": self._data.get('llama_server_batch_size'),
-            "whispercd_alpha": self._data.get('whispercd_alpha'),
-            "whispercd_temperature": self._data.get('whispercd_temperature'),
-            "whispercd_snr_db": self._data.get('whispercd_snr_db'),
-            "whispercd_temporal_shift": self._data.get('whispercd_temporal_shift'),
-            "whispercd_context_max_tokens": self._data.get('whispercd_context_max_tokens'),
-        }
 
 
 WHISPER_MODEL_PATTERNS: Dict[str, List[str]] = {
@@ -614,7 +543,7 @@ LANGUAGE_OPTIONS: List[Tuple[str, str]] = [
 
 DEVICE_OPTIONS: List[str] = ["auto", "cuda", "cpu"]
 
-TRANSLATOR_QUANTIZATION_OPTIONS: List[str] = ["auto", "Q4_K_M", "Q6_K", "Q8_0"]
+TRANSLATOR_QUANTIZATION_OPTIONS: List[str] = ["Q8_0"]
 
 config = ConfigManager()
 
@@ -631,7 +560,7 @@ __all__ = [
     'TEMP_DIR',
     'OUTPUT_DIR',
     'CONFIG_FILE',
-    'VadParams',
+    'IS_PACKAGE_MODE',
     'CdParams',
     'TransParams',
     'ServerParams',

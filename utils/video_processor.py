@@ -5,8 +5,11 @@ import subprocess
 from config import TEMP_DIR
 
 def find_ffmpeg():
-    """查找FFmpeg可执行文件"""
-    current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        from config import PROJECT_ROOT
+        current_dir = PROJECT_ROOT
+    except ImportError:
+        current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ffmpeg_dir = os.path.join(current_dir, "ffmpeg")
     
     # 尝试多种可能的FFmpeg目录结构

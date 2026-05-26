@@ -12,10 +12,14 @@ def _write_srt(segments, output_path, text_extractor, label):
 
         with open(final_path, 'w', encoding='utf-8') as f:
             for i, seg in enumerate(segments, 1):
+                words = seg.get('words', [])
+                start_time = words[0]['start'] if words else seg.get('start', 0)
+                end_time = words[-1]['end'] if words else seg.get('end', 0)
                 f.write(f"{i}\n")
-                f.write(f"{format_time(seg.get('start', 0))} --> {format_time(seg.get('end', 0))}\n")
+                f.write(f"{format_time(start_time)} --> {format_time(end_time)}\n")
                 f.write(f"{text_extractor(seg)}\n\n")
 
+        print(f"[字幕] 写入 {len(segments)} 条字幕记录到 {final_path}")
         print(f"{label}字幕生成完成: {final_path}")
         return final_path
     except Exception as e:
@@ -45,7 +49,7 @@ def generate_bilingual_subtitle(translated_result, output_path, progress_callbac
     return _write_srt(
         translated_result.get('segments', []),
         output_path,
-        lambda seg: f"{seg.get('original_text', seg.get('text', ''))}\n{seg.get('translated', '')}",
+        lambda seg: f"{seg.get('original_text', seg.get('text', ''))}\n{seg.get('translated', seg.get('text', ''))}",
         "双语"
     )
 

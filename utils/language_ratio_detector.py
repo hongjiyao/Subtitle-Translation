@@ -5,7 +5,7 @@
 """
 
 import re
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 
 # 语言字符范围定义
@@ -106,13 +106,19 @@ def is_korean_char(char: str) -> bool:
 def detect_language_chars(text: str) -> Dict[str, int]:
     """检测文本中各语言的字符数量
 
+    注意：CJK统一表意文字（U+4E00-U+9FFF）统一归入'chinese'类别，
+    包括中文汉字和日文汉字（如"私"、"教室"等）。
+    日文假名（平假名 U+3040-U+309F、片假名 U+30A0-U+30FF）
+    归入'japanese'类别。这是有意为之的设计：汉字无法仅凭码点区分
+    所属语言，需结合假名等特征判断。
+
     Args:
         text: 待检测文本
 
     Returns:
         Dict[str, int]: 各语言的字符数量，键包括：
-        - 'chinese': 中文字符数量
-        - 'japanese': 日文字符数量
+        - 'chinese': 中文字符数量（含CJK汉字及中文标点）
+        - 'japanese': 日文字符数量（仅假名）
         - 'korean': 韩文字符数量
         - 'latin': 拉丁字母数量
         - 'other': 其他字符数量
@@ -123,6 +129,9 @@ def detect_language_chars(text: str) -> Dict[str, int]:
             'japanese': 0,
             'korean': 0,
             'latin': 0,
+            'cyrillic': 0,
+            'arabic': 0,
+            'devanagari': 0,
             'other': 0
         }
 
@@ -131,6 +140,10 @@ def detect_language_chars(text: str) -> Dict[str, int]:
         'japanese': 0,
         'korean': 0,
         'latin': 0,
+        'cyrillic': 0,
+        'arabic': 0,
+        'devanagari': 0,
+        'thai': 0,
         'other': 0
     }
 
@@ -143,6 +156,14 @@ def detect_language_chars(text: str) -> Dict[str, int]:
             counts['korean'] += 1
         elif is_latin_char(char):
             counts['latin'] += 1
+        elif 0x0400 <= ord(char) <= 0x04FF:  # Cyrillic
+            counts['cyrillic'] += 1
+        elif 0x0600 <= ord(char) <= 0x06FF:  # Arabic
+            counts['arabic'] += 1
+        elif 0x0900 <= ord(char) <= 0x097F:  # Devanagari
+            counts['devanagari'] += 1
+        elif 0x0E00 <= ord(char) <= 0x0E7F:  # Thai
+            counts['thai'] += 1
         elif is_other_chinese_char(char):
             # 中文标点符号也算作中文字符
             counts['chinese'] += 1
@@ -212,25 +233,38 @@ def check_translation_success(
     if not translated_text:
         return False, 0.0, {}
 
-    # 统计译文的语言字符
+    total = len(translated_text)
+    if total == 0:
+        return False, 0.0, {}
+
     lang_counts = detect_language_chars(translated_text)
 
-    # 计算目标语言占比
+    # Language family mapping
+    LATIN_LANGS = {'en', 'fr', 'de', 'es', 'pt', 'it', 'nl', 'pl', 'sv', 'no', 'da', 'fi', 'cs', 'sk', 'hu', 'ro', 'bg', 'hr', 'sl', 'lt', 'lv', 'et', 'tr', 'id', 'ms', 'vi', 'tl'}
+    CYRILLIC_LANGS = {'ru', 'uk', 'be', 'bg', 'sr', 'mk'}
+    ARABIC_LANGS = {'ar', 'fa', 'ur', 'ps'}
+    DEVANAGARI_LANGS = {'hi', 'bn', 'ne', 'mr'}
+    THAI_LANGS = {'th', 'lo'}
+
     if target_lang == 'zh':
-        # 目标是中文，检测中文字符占比
-        target_ratio = lang_counts['chinese'] / len(translated_text)
+        target_ratio = lang_counts['chinese'] / total
     elif target_lang == 'ja':
-        # 目标是日语，检测日文字符占比
-        target_ratio = lang_counts['japanese'] / len(translated_text)
+        target_ratio = (lang_counts['japanese'] + lang_counts['chinese']) / total
     elif target_lang == 'ko':
-        # 目标是韩语，检测韩文字符占比
-        target_ratio = lang_counts['korean'] / len(translated_text)
-    elif target_lang == 'en':
-        # 目标是英语，检测拉丁字母占比
-        target_ratio = lang_counts['latin'] / len(translated_text)
+        target_ratio = lang_counts['korean'] / total
+    elif target_lang in LATIN_LANGS:
+        target_ratio = lang_counts['latin'] / total
+    elif target_lang in CYRILLIC_LANGS:
+        target_ratio = lang_counts['cyrillic'] / total
+    elif target_lang in ARABIC_LANGS:
+        target_ratio = lang_counts['arabic'] / total
+    elif target_lang in DEVANAGARI_LANGS:
+        target_ratio = lang_counts['devanagari'] / total
+    elif target_lang in THAI_LANGS:
+        target_ratio = lang_counts['thai'] / total
     else:
-        # 默认检测中文字符占比
-        target_ratio = lang_counts['chinese'] / len(translated_text)
+        # Fallback: check that translation differs from source and is non-empty
+        target_ratio = 1.0 if (translated_text.strip() and translated_text.strip() != original_text.strip()) else 0.0
 
     # 判断翻译是否成功
     success = target_ratio >= threshold
@@ -248,11 +282,12 @@ def is_translation_valid(original_text, translated_text, source_lang='ja', targe
     if len(translated_text) <= 5:
         if original_text.strip() == translated_text.strip():
             return False, 0.0, {}
-        success, target_ratio, lang_counts = check_translation_success(
-            original_text, translated_text, source_lang, target_lang, threshold=0.3
-        )
-        if not success and target_ratio < 0.2:
-            return False, target_ratio, lang_counts
+        lang_counts = detect_language_chars(translated_text)
+        lang_key = {'zh': 'chinese', 'ja': 'japanese', 'ko': 'korean', 'en': 'latin'}.get(target_lang, 'chinese')
+        if lang_counts.get(lang_key, 0) > 0:
+            total = len(translated_text)
+            target_ratio = lang_counts[lang_key] / total if total > 0 else 0.0
+            return True, target_ratio, lang_counts
     
     success, target_ratio, lang_counts = check_translation_success(
         original_text, translated_text, source_lang, target_lang, threshold=threshold
@@ -266,7 +301,7 @@ def get_translation_quality_info(
     translated_text: str,
     source_lang: str = 'ja',
     target_lang: str = 'zh'
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """获取翻译质量详细信息
 
     Args:
@@ -290,22 +325,41 @@ def get_translation_quality_info(
     lang_counts = detect_language_chars(translated_text)
     total_chars = len(translated_text)
 
-    # 计算目标语言占比
+    # 使用与 check_translation_success 一致的语言族映射
+    LATIN_LANGS = {'en', 'fr', 'de', 'es', 'pt', 'it', 'nl', 'pl', 'sv', 'no', 'da', 'fi', 'cs', 'sk', 'hu', 'ro', 'bg', 'hr', 'sl', 'lt', 'lv', 'et', 'tr', 'id', 'ms', 'vi', 'tl'}
+    CYRILLIC_LANGS = {'ru', 'uk', 'be', 'bg', 'sr', 'mk'}
+    ARABIC_LANGS = {'ar', 'fa', 'ur', 'ps'}
+    DEVANAGARI_LANGS = {'hi', 'bn', 'ne', 'mr'}
+    THAI_LANGS = {'th', 'lo'}
+
+    LANG_NAMES = {
+        'zh': '中文', 'ja': '日文', 'ko': '韩文', 'en': '英文',
+        'fr': '法文', 'de': '德文', 'es': '西班牙文', 'pt': '葡萄牙文',
+        'it': '意大利文', 'nl': '荷兰文', 'pl': '波兰文', 'ru': '俄文',
+        'ar': '阿拉伯文', 'hi': '印地文', 'th': '泰文', 'fa': '波斯文',
+        'fi': '芬兰文',
+    }
+
     if target_lang == 'zh':
         target_ratio = lang_counts['chinese'] / total_chars if total_chars > 0 else 0.0
-        target_lang_name = '中文'
     elif target_lang == 'ja':
-        target_ratio = lang_counts['japanese'] / total_chars if total_chars > 0 else 0.0
-        target_lang_name = '日文'
+        target_ratio = (lang_counts['japanese'] + lang_counts['chinese']) / total_chars if total_chars > 0 else 0.0
     elif target_lang == 'ko':
         target_ratio = lang_counts['korean'] / total_chars if total_chars > 0 else 0.0
-        target_lang_name = '韩文'
-    elif target_lang == 'en':
+    elif target_lang in LATIN_LANGS:
         target_ratio = lang_counts['latin'] / total_chars if total_chars > 0 else 0.0
-        target_lang_name = '英文'
+    elif target_lang in CYRILLIC_LANGS:
+        target_ratio = lang_counts['cyrillic'] / total_chars if total_chars > 0 else 0.0
+    elif target_lang in ARABIC_LANGS:
+        target_ratio = lang_counts['arabic'] / total_chars if total_chars > 0 else 0.0
+    elif target_lang in DEVANAGARI_LANGS:
+        target_ratio = lang_counts['devanagari'] / total_chars if total_chars > 0 else 0.0
+    elif target_lang in THAI_LANGS:
+        target_ratio = lang_counts['thai'] / total_chars if total_chars > 0 else 0.0
     else:
-        target_ratio = lang_counts['chinese'] / total_chars if total_chars > 0 else 0.0
-        target_lang_name = '目标语言'
+        target_ratio = 1.0 if (translated_text.strip() and translated_text.strip() != original_text.strip()) else 0.0
+
+    target_lang_name = LANG_NAMES.get(target_lang, '目标语言')
 
     success = target_ratio >= 0.5
 

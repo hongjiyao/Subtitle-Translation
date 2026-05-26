@@ -4,40 +4,52 @@
 import os
 import gc
 import re
+import time
+
+try:
+    import torch
+except ImportError:
+    torch = None
 
 from utils.llama_server_manager import LlamaServerManager
 from utils.language_ratio_detector import check_translation_success, is_translation_valid
-from utils.logger import timestamp_print
 
-from config import MODEL_CACHE_DIR, config, TransParams
 
+from config import MODEL_CACHE_DIR, config, TransParams, ServerParams
+
+
+_active_server_manager = None
 
 def clear_translator_cache(server_manager=None):
     """清空翻译模型缓存以释放内存并停止服务器进程"""
+    global _active_server_manager
+    target = server_manager or _active_server_manager
     try:
-        if server_manager is not None:
-            server_manager.stop_server()
-            timestamp_print("[llama-server] 已通过 server_manager 停止服务器进程")
-        else:
-            import subprocess
-            subprocess.run(["taskkill", "/F", "/IM", "llama-server.exe"], capture_output=True, text=True)
-            timestamp_print("[llama-server] 已停止服务器进程")
+        if target is not None:
+            target.stop_server()
+            print("[llama-server] 已通过 server_manager 停止服务器进程")
     except Exception as e:
-        timestamp_print(f"[llama-server] 停止服务器时出错: {e}")
-    
+        print(f"[llama-server] 停止服务器时出错: {e}")
+
+    _active_server_manager = None
     gc.collect()
-    timestamp_print("[内存管理] 已执行垃圾回收")
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("[内存管理] 已执行垃圾回收和显存清理")
 
 
 class LlamaCppTranslator:
     """使用 llama-server HTTP API 运行 GGUF 模型的翻译器"""
 
-    def __init__(self, model_path=None):
-        system_prompt = "You are a translator. Your only task is to translate the given text from the source language to the target language. Output only the translation, nothing else. Do not include any instructions or explanations in your response."
-        self.server_manager = LlamaServerManager(system_prompt=system_prompt, port=8080)
+    def __init__(self, model_path=None, server_params: ServerParams = None):
+        self.system_prompt = "You are a translator. Your only task is to translate the given text from the source language to the target language. Output only the translation, nothing else. Do not include any instructions or explanations in your response."
+        if server_params is None:
+            server_params = ServerParams.from_dict(config.get_all())
+        self.server_manager = LlamaServerManager(server_params=server_params)
+        self.chat_history = []
         
-        timestamp_print(f"[llama-server翻译] 使用 HTTP API: {self.server_manager.host}:{self.server_manager.port}")
-        timestamp_print(f"[llama-server翻译] 模型: {self.server_manager.model_path}")
+        print(f"[llama-server翻译] 使用 HTTP API: {self.server_manager.host}:{self.server_manager.port}")
+        print(f"[llama-server翻译] 模型: {self.server_manager.model_path}")
 
     def compress_repeated_sequences(self, text: str, keep_count: int = 1) -> str:
         """
@@ -91,15 +103,22 @@ class LlamaCppTranslator:
         if not sequences:
             return text
         
-        sequences.sort(key=lambda x: x[2], reverse=True)
+        sequences.sort(key=lambda x: x[2])
         
         result = text
+        offset = 0
         for seq, repeat_count, start_pos in sequences:
             keep_seq = seq * keep_count
             original_len = len(seq) * repeat_count
-            max_len = len(result) - start_pos
+            actual_pos = start_pos + offset
+            if actual_pos >= len(result):
+                continue
+            max_len = len(result) - actual_pos
+            if max_len <= 0:
+                continue
             original_len = min(original_len, max_len)
-            result = result[:start_pos] + keep_seq + result[start_pos + original_len:]
+            result = result[:actual_pos] + keep_seq + result[actual_pos + original_len:]
+            offset += len(keep_seq) - original_len
         
         cleaned = []
         i = 0
@@ -135,6 +154,10 @@ class LlamaCppTranslator:
         # Step 3: Collapse multiple whitespace to single space
         text = re.sub(r'\s+', ' ', text)
         
+        # Step 3.5: Remove spaces between CJK characters
+        cjk_chars = r'\u3000-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af\uff00-\uffef\u3000-\u303f'
+        text = re.sub(f'(?<=[{cjk_chars}])\\s+(?=[{cjk_chars}])', '', text)
+        
         # Step 4: Compress repeated character sequences (existing logic)
         text = self.compress_repeated_sequences(text, keep_count)
         
@@ -142,49 +165,67 @@ class LlamaCppTranslator:
 
     def translate(self, text, source_lang="en", target_lang="zh", trans_params=None):
         """翻译单个文本"""
-        return self._translate_multi_fallback(text, source_lang, target_lang, trans_params)
+        result = self._translate_multi_fallback(text, source_lang, target_lang, trans_params)
+        return result[0] if isinstance(result, tuple) else result
 
     def _translate_multi_fallback(self, text, source_lang="en", target_lang="zh", trans_params=None, context=None):
-        """使用单次调用模式进行翻译"""
+        """使用 Chat API 进行翻译，保留翻译历史以利用 KV cache"""
         if trans_params is None:
             trans_params = TransParams()
         processed_text = self.preprocess_text(text)
         
         lang_map = {
-            "zh": "Chinese",
-            "en": "English",
-            "ja": "Japanese",
-            "ko": "Korean",
-            "fr": "French",
-            "de": "German",
-            "es": "Spanish",
-            "ru": "Russian",
-            "ar": "Arabic",
-            "hi": "Hindi",
-            "pt": "Portuguese",
-            "it": "Italian",
-            "nl": "Dutch",
-            "pl": "Polish"
+            "zh": "Chinese", "en": "English", "ja": "Japanese", "ko": "Korean",
+            "fr": "French", "de": "German", "es": "Spanish", "ru": "Russian",
+            "ar": "Arabic", "hi": "Hindi", "pt": "Portuguese", "it": "Italian",
+            "nl": "Dutch", "pl": "Polish"
         }
 
         source_lang_name = lang_map.get(source_lang, source_lang)
         target_lang_name = lang_map.get(target_lang, target_lang)
 
         if context:
-            prompt = f"Context: {context}\n\nTranslate the following {source_lang_name} text to {target_lang_name}. Only output the translation, nothing else.\n\n{source_lang_name}: {processed_text}\n{target_lang_name}:"
+            user_content = f"Context: {context}\n\nTranslate the following {source_lang_name} text to {target_lang_name}. Only output the translation, nothing else.\n\n{source_lang_name}: {processed_text}"
         else:
-            prompt = f"Translate the following {source_lang_name} text to {target_lang_name}. Only output the translation, nothing else.\n\n{source_lang_name}: {processed_text}\n{target_lang_name}:"
+            user_content = f"Translate the following {source_lang_name} text to {target_lang_name}. Only output the translation, nothing else.\n\n{source_lang_name}: {processed_text}"
 
         try:
             temperature = trans_params.temperature
             top_k = trans_params.top_k
             top_p = trans_params.top_p
             repetition_penalty = trans_params.rep_penalty
-            
-            self.server_manager.ensure_server_running()
-            n_predict = max(100, len(processed_text) * 3)
-            output = self.server_manager.send_request(
-                prompt,
+
+            if not self.server_manager.ensure_server_running():
+                raise RuntimeError("llama-server 启动失败，无法进行翻译")
+            text_len = len(processed_text)
+            if text_len <= 5:
+                n_predict = 64
+            elif text_len <= 20:
+                n_predict = max(32, text_len * 2)
+            else:
+                n_predict = max(64, text_len * 2)
+            max_context_tokens = getattr(self.server_manager, 'context_size', 4096)
+            estimated_prompt_tokens = len(user_content) * 2 + sum(len(m['content']) * 2 for m in self.chat_history)
+            # 如果估算的prompt token数超过max_context_tokens，截断chat_history
+            if estimated_prompt_tokens > max_context_tokens:
+                while self.chat_history and estimated_prompt_tokens > max_context_tokens:
+                    removed = self.chat_history.pop(0)
+                    estimated_prompt_tokens -= len(removed['content']) * 2
+            max_n_predict = max_context_tokens - estimated_prompt_tokens - 200
+            if max_n_predict > 0:
+                n_predict = min(n_predict, max_n_predict)
+            else:
+                n_predict = min(n_predict, 256)
+            # 使用 trans_params.max_output_tokens 限制最大输出
+            n_predict = min(n_predict, trans_params.max_output_tokens)
+            n_predict = max(n_predict, 64)
+
+            messages = [{"role": "system", "content": self.system_prompt}]
+            messages.extend(self.chat_history)
+            messages.append({"role": "user", "content": user_content})
+
+            output = self.server_manager.send_chat_request(
+                messages,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
@@ -195,6 +236,9 @@ class LlamaCppTranslator:
             
             if output is None:
                 raise RuntimeError("llama-server 请求返回为空")
+
+            if output == "":
+                print(f"[翻译] 警告：翻译返回为空，原文: {processed_text[:50]}")
 
             output = output.strip()
             
@@ -208,106 +252,116 @@ class LlamaCppTranslator:
             
             translation = output.strip()
             translation = " ".join(translation.split())
-            
-            return translation
+
+            return translation, processed_text
 
         except Exception as e:
-            raise RuntimeError(f"llama-server 翻译失败: {str(e)}")
+            raise RuntimeError(f"llama-server 翻译失败: {str(e)}") from e
 
     def translate_batch(self, segments, source_lang="en", target_lang="zh", progress_callback=None, trans_params: TransParams = None):
         if trans_params is None:
             trans_params = TransParams()
         
-        def extract_context(segments, index, window_size=None):
-            """提取上下文信息"""
-            if window_size is None:
-                window_size = trans_params.seg_ctx_window
-            current_text = segments[index].get('text', '')
-            if len(current_text) <= 5:
-                return ""
-            context = []
-            for i in range(max(0, index - window_size), index):
-                context.append(f"Previous: {segments[i].get('translated', segments[i]['text'])}")
-            for i in range(index + 1, min(len(segments), index + window_size + 1)):
-                context.append(f"Next: {segments[i]['text']}")
-            return " ".join(context)
-        
+        lang_map = {
+            "zh": "Chinese", "en": "English", "ja": "Japanese", "ko": "Korean",
+            "fr": "French", "de": "German", "es": "Spanish", "ru": "Russian",
+            "ar": "Arabic", "hi": "Hindi", "pt": "Portuguese", "it": "Italian",
+            "nl": "Dutch", "pl": "Polish"
+        }
+        source_lang_name = lang_map.get(source_lang, source_lang)
+        target_lang_name = lang_map.get(target_lang, target_lang)
+
         total_segments = len(segments)
-        timestamp_print(f"[llama-server翻译] 开始单条翻译，共 {total_segments} 个片段")
-        timestamp_print(f"[llama-server翻译] 上下文大小: {trans_params.ctx_size}, 最大输出: {trans_params.max_output_tokens} tokens")
+        print(f"[llama-server翻译] 开始单条翻译，共 {total_segments} 个片段")
+        print(f"[llama-server翻译] 最大输出: {trans_params.max_output_tokens} tokens")
+        
+        batch_start_time = time.time()
+        
+        # 预计算所有片段的上下文
+        context_cache = []
+        for i in range(total_segments):
+            current_text = segments[i].get('text', '')
+            if len(current_text) <= 5:
+                context_cache.append("")
+                continue
+            ctx_parts = []
+            for j in range(max(0, i - trans_params.seg_ctx_window), i):
+                ctx_parts.append(f"Previous: {segments[j].get('text', '')}")
+            for j in range(i + 1, min(len(segments), i + trans_params.seg_ctx_window + 1)):
+                ctx_parts.append(f"Next: {segments[j].get('text', '')}")
+            context_cache.append(" ".join(ctx_parts))
         
         reset_session = trans_params.reset_session
         if reset_session:
-            timestamp_print("[llama-server翻译] 重置会话状态，确保全新的翻译环境...")
+            print("[llama-server翻译] 重置会话状态，确保全新的翻译环境...")
+            self.chat_history = []
             self.server_manager.reset_session()
         else:
             self.server_manager.ensure_server_running()
         
         processed_count = 0
-        for i, segment in enumerate(segments):
-            text = segment["text"]
-            context = extract_context(segments, i)
+        for i, seg in enumerate(segments):
+            # 跳过空文本
+            original_text = seg.get('text', '').strip()
+            if not original_text:
+                seg['translated'] = ''
+                continue
+
+            text = seg["text"]
+            context = context_cache[i]
             
             max_retries = trans_params.max_retries
             retry_count = 0
             translation = None
+            seg_start_time = time.time()
             
             while retry_count < max_retries:
                 try:
-                    translation = self._translate_multi_fallback(text, source_lang, target_lang, trans_params, context)
-                    
+                    translation, processed_text = self._translate_multi_fallback(text, source_lang, target_lang, trans_params, context)
+
                     is_valid = is_translation_valid(text, translation, source_lang, target_lang)[0]
-                    
+
                     if is_valid:
-                        segment["translated"] = translation
+                        seg["translated"] = translation
+                        seg["_validated"] = True
+                        if len(processed_text) > 5:
+                            user_content = f"{source_lang_name}: {processed_text}"
+                            self.chat_history.append({"role": "user", "content": user_content})
+                            self.chat_history.append({"role": "assistant", "content": translation})
+                            max_history_pairs = trans_params.seg_ctx_window
+                            max_history_messages = max_history_pairs * 2
+                            if len(self.chat_history) > max_history_messages:
+                                self.chat_history = self.chat_history[-max_history_messages:]
                     else:
-                        segment["translated"] = text
+                        seg["translated"] = text
+                        seg["_validated"] = False
                     
-                    timestamp_print(f'[翻译] 第{i+1}/{total_segments}条: "{text[:30]}..." → "{translation[:30]}..."')
+                    seg_elapsed = time.time() - seg_start_time
+                    print(f'[翻译] 第{i+1}/{total_segments}条 ({seg_elapsed:.1f}s): "{text[:30]}..." → "{translation[:30]}..."')
                     break
                 except Exception as e:
                     retry_count += 1
-                    error_str = str(e).lower()
-                    if 'connection' in error_str or 'connect' in error_str or 'refused' in error_str:
-                        self.server_manager.reset_session()
-                    else:
-                        self.server_manager.ensure_server_running()
-                    timestamp_print(f"[llama-server翻译] 翻译失败，第{retry_count}次重试: {str(e)}")
+                    self.server_manager.ensure_server_running()
+                    print(f"[llama-server翻译] 翻译失败，第{retry_count}次重试: {str(e)}")
                     if retry_count >= max_retries:
-                        segment["translated"] = text
-                        timestamp_print(f"[llama-server翻译] 多次重试失败，使用原文")
+                        seg["translated"] = text
+                        print(f"[llama-server翻译] 多次重试失败，使用原文")
             
             processed_count += 1
             if progress_callback and total_segments > 0:
                 progress_callback(int(processed_count / total_segments * 100))
         
-        timestamp_print(f"[llama-server翻译] 单条翻译完成，共翻译 {total_segments} 个片段")
+        print(f"[llama-server翻译] 单条翻译完成，共翻译 {total_segments} 个片段")
         
-        # 验证翻译结果
-        timestamp_print(f"[llama-server翻译] 开始验证翻译结果...")
-        
-        success_count = 0
-        fail_count = 0
-        untranslated_indices = []
-        
-        for i, segment in enumerate(segments):
-            original_text = segment["text"]
-            translated_text = segment.get("translated", "")
-            
-            success, target_ratio, lang_counts = is_translation_valid(
-                original_text, translated_text, source_lang, target_lang, threshold=0.5
-            )
-            
-            if success:
-                success_count += 1
-            else:
-                untranslated_indices.append(i)
-                fail_count += 1
-        
-        timestamp_print(f"[llama-server翻译] 验证完成: 成功 {success_count} 个, 失败 {fail_count} 个")
+        # 验证翻译结果（首次翻译已验证，直接统计）
+        success_count = sum(1 for seg in segments if seg.get("_validated", False))
+        untranslated_indices = [i for i, seg in enumerate(segments) if not seg.get("_validated", False) and seg.get('text', '').strip()]
+        fail_count = len(untranslated_indices)
+
+        print(f"[llama-server翻译] 验证完成: 成功 {success_count} 个, 失败 {fail_count} 个")
         
         if untranslated_indices:
-            timestamp_print(f"[llama-server翻译] 发现 {len(untranslated_indices)} 个片段未翻译或翻译失败，开始重新翻译...")
+            print(f"[llama-server翻译] 发现 {len(untranslated_indices)} 个片段未翻译或翻译失败，开始重新翻译...")
             
             max_total_retries = trans_params.max_total_retries
             current_retries = {idx: 0 for idx in untranslated_indices}
@@ -323,76 +377,75 @@ class LlamaCppTranslator:
                     if len(text) <= 5:
                         context = ""
                     else:
-                        context = extract_context(segments, idx)
+                        context = context_cache[idx]
                     
                     current_retries[idx] += 1
                     retry_count = current_retries[idx]
                     
                     if retry_count > max_total_retries:
                         segment["translated"] = text
-                        timestamp_print(f"[llama-server翻译] 片段 {idx+1} 达到最大重试次数 {max_total_retries}，使用原文")
+                        print(f"[llama-server翻译] 片段 {idx+1} 达到最大重试次数 {max_total_retries}，使用原文")
                         continue
                     
-                    timestamp_print(f"[llama-server翻译] 重新翻译片段 {idx+1}/{total_segments} (第{retry_count}次): {text[:30]}...")
+                    print(f"[llama-server翻译] 重新翻译片段 {idx+1}/{total_segments} (第{retry_count}次): {text[:30]}...")
                     
+                    retry_start_time = time.time()
                     try:
-                        translation = self._translate_multi_fallback(text, source_lang, target_lang, trans_params, context)
-                        
+                        translation, processed_text = self._translate_multi_fallback(text, source_lang, target_lang, trans_params, context)
+
                         is_valid = is_translation_valid(text, translation, source_lang, target_lang)[0]
-                        
+
                         if is_valid:
                             segment["translated"] = translation
-                            timestamp_print(f'[翻译] 第{idx+1}/{total_segments}条: "{text[:30]}..." → "{translation[:30]}..."')
+                            if len(processed_text) > 5:
+                                user_content = f"{source_lang_name}: {processed_text}"
+                                self.chat_history.append({"role": "user", "content": user_content})
+                                self.chat_history.append({"role": "assistant", "content": translation})
+                                max_history_pairs = trans_params.seg_ctx_window
+                                max_history_messages = max_history_pairs * 2
+                                if len(self.chat_history) > max_history_messages:
+                                    self.chat_history = self.chat_history[-max_history_messages:]
+                            retry_elapsed = time.time() - retry_start_time
+                            print(f'[翻译] 第{idx+1}/{total_segments}条 ({retry_elapsed:.1f}s): "{text[:30]}..." → "{translation[:30]}..."')
                         else:
                             remaining_indices.append(idx)
                     except Exception as e:
-                        error_str = str(e).lower()
-                        if 'connection' in error_str or 'connect' in error_str or 'refused' in error_str:
-                            self.server_manager.reset_session()
-                        else:
-                            self.server_manager.ensure_server_running()
-                        timestamp_print(f"[llama-server翻译] 重新翻译失败，第{retry_count}次重试: {str(e)}")
+                        self.server_manager.ensure_server_running()
+                        print(f"[llama-server翻译] 重新翻译失败，第{retry_count}次重试: {str(e)}")
                         remaining_indices.append(idx)
             
             if remaining_indices:
-                timestamp_print(f"[llama-server翻译] 仍有 {len(remaining_indices)} 个片段翻译失败，使用原文")
+                print(f"[llama-server翻译] 仍有 {len(remaining_indices)} 个片段翻译失败，使用原文")
                 for idx in remaining_indices:
                     segments[idx]["translated"] = segments[idx]["text"]
             
-            timestamp_print(f"[llama-server翻译] 重新翻译完成")
+            print(f"[llama-server翻译] 重新翻译完成")
         else:
-            timestamp_print(f"[llama-server翻译] 所有片段翻译成功，无需重新翻译")
+            print(f"[llama-server翻译] 所有片段翻译成功，无需重新翻译")
+        
+        for seg in segments:
+            seg.pop("_validated", None)
+        
+        batch_elapsed = time.time() - batch_start_time
+        avg_time = batch_elapsed / total_segments if total_segments > 0 else 0
+        print(f"[llama-server翻译] 翻译统计: 共 {total_segments} 条, 总耗时 {batch_elapsed:.1f}s, 平均 {avg_time:.2f}s/条")
         
         return segments
 
 
 def get_local_model_path(model_path):
-    """获取本地模型路径"""
-    model_name = model_path.replace("tencent/", "").replace("tencent--", "").split("/")[-1]
-
-    possible_paths = [
-        os.path.join(MODEL_CACHE_DIR, model_name),
-        os.path.join(MODEL_CACHE_DIR, f"tencent--{model_name}"),
-        os.path.join(MODEL_CACHE_DIR, "tencent", model_name),
-        os.path.join(MODEL_CACHE_DIR, "tencent--HY-MT1.5-7B-GGUF"),
-        os.path.join(MODEL_CACHE_DIR, "HY-MT1.5-7B-GGUF"),
-    ]
-
-    for path in possible_paths:
-        if os.path.exists(path) and os.path.isdir(path):
-            timestamp_print(f"[翻译] 找到本地模型: {path}")
-            return path
-
-    direct_path = os.path.join(MODEL_CACHE_DIR, model_path.replace("/", "--"))
-    if os.path.exists(direct_path) and os.path.isdir(direct_path):
-        timestamp_print(f"[翻译] 找到本地模型: {direct_path}")
-        return direct_path
-
+    """获取本地模型路径，复用 LlamaServerManager 的模型查找逻辑"""
+    from utils.llama_server_manager import LlamaServerManager
+    server_params = ServerParams.from_dict(config.get_all())
+    manager = LlamaServerManager(server_params=server_params)
+    if manager.model_path:
+        print(f"[翻译] 找到本地模型: {manager.model_path}")
+        return os.path.dirname(manager.model_path)
     return None
 
 
-def translate_text(recognized_result, model_path, device_choice="auto", progress_callback=None,
-                   beam_size=1, max_length=256, target_language="zh", trans_params: TransParams = None):
+def translate_text(recognized_result, model_path, progress_callback=None,
+                   target_language="zh", trans_params: TransParams = None, server_params: ServerParams = None):
     """翻译识别结果"""
     if trans_params is None:
         trans_params = TransParams()
@@ -402,19 +455,19 @@ def translate_text(recognized_result, model_path, device_choice="auto", progress
     local_model_path = get_local_model_path(model_path)
     if not local_model_path:
         error_msg = f"本地模型不存在: {model_path}，请确保模型已在models目录中"
-        timestamp_print(f"[错误信息] {error_msg}")
+        print(f"[错误信息] {error_msg}")
         raise FileNotFoundError(error_msg)
 
-    translated_result = translate_with_llama_server(recognized_result, progress_callback, target_language, trans_params)
+    translated_result = translate_with_llama_server(recognized_result, progress_callback, target_language, trans_params, server_params)
     
     if 'segments' in translated_result:
         has_translation = any('translated' in seg for seg in translated_result['segments'])
-        timestamp_print(f"[翻译] 翻译完成，{len(translated_result['segments'])} 个片段，其中 {sum(1 for seg in translated_result['segments'] if 'translated' in seg)} 个片段有翻译")
+        print(f"[翻译] 翻译完成，{len(translated_result['segments'])} 个片段，其中 {sum(1 for seg in translated_result['segments'] if 'translated' in seg)} 个片段有翻译")
     
     return translated_result
 
 
-def translate_with_llama_server(recognized_result, progress_callback, target_language, trans_params=None):
+def translate_with_llama_server(recognized_result, progress_callback, target_language, trans_params=None, server_params=None):
     """使用 llama-server HTTP API 运行 GGUF 模型进行翻译"""
     if trans_params is None:
         trans_params = TransParams()
@@ -423,12 +476,12 @@ def translate_with_llama_server(recognized_result, progress_callback, target_lan
     if source_language == 'auto':
         if recognized_result.get('text'):
             text = recognized_result['text']
-            if any('\u4e00' <= c <= '\u9fff' for c in text):
-                source_language = 'zh'
-            elif any('\u3040' <= c <= '\u30ff' for c in text):
+            if any('\u3040' <= c <= '\u30ff' for c in text):  # Japanese kana (hiragana + katakana)
                 source_language = 'ja'
-            elif any('\uac00' <= c <= '\ud7af' for c in text):
+            elif any('\uac00' <= c <= '\ud7af' for c in text):  # Korean
                 source_language = 'ko'
+            elif any('\u4e00' <= c <= '\u9fff' for c in text):  # CJK ideographs
+                source_language = 'zh'
             else:
                 source_language = 'en'
         else:
@@ -448,8 +501,12 @@ def translate_with_llama_server(recognized_result, progress_callback, target_lan
             original_text = seg['text']
             seg['original_text'] = original_text
     
-    translator = LlamaCppTranslator()
-    
+    server_params = server_params or ServerParams.from_dict(config.get_all())
+    translator = LlamaCppTranslator(server_params=server_params)
+
+    global _active_server_manager
+    _active_server_manager = translator.server_manager
+
     try:
         translated_segments = translator.translate_batch(
             segments,
@@ -461,7 +518,10 @@ def translate_with_llama_server(recognized_result, progress_callback, target_lan
         
         recognized_result['segments'] = translated_segments
         
-        translated_text = ''.join([seg.get('translated', seg.get('text', '')) for seg in translated_segments])
+        # CJK语言不使用空格连接
+        is_cjk_target = target_language and target_language.startswith(('zh', 'ja', 'ko'))
+        separator = '' if is_cjk_target else ' '
+        translated_text = separator.join([seg.get('translated', seg.get('text', '')) for seg in translated_segments])
         recognized_result['translated_text'] = translated_text
         
         return recognized_result

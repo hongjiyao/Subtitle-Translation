@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
 """日志记录模块"""
 
-import logging
 import sys
-import os
-import re
-import time
 from pathlib import Path
 from datetime import datetime
-from logging.handlers import RotatingFileHandler
 
-PROJECT_ROOT = Path(__file__).parent.parent
+try:
+    from config import PROJECT_ROOT as _PROJECT_ROOT
+    PROJECT_ROOT = Path(_PROJECT_ROOT)
+except ImportError:
+    PROJECT_ROOT = Path(__file__).parent.parent
 LOG_DIR = PROJECT_ROOT / "logs"
 
 LOG_DIR.mkdir(exist_ok=True)
@@ -34,6 +33,13 @@ class PrintRedirect:
     def isatty(self):
         return self.terminal.isatty()
 
+    def close(self):
+        if hasattr(self, 'log') and self.log and not self.log.closed:
+            self.log.close()
+
+    def __del__(self):
+        self.close()
+
 
 def setup_print_redirect():
     """设置print输出重定向"""
@@ -47,124 +53,3 @@ def setup_print_redirect():
     sys.stderr = PrintRedirect(log_filepath)
     
     print(f"[日志重定向] 已设置输出重定向到: {log_filepath}")
-
-
-def init_logger(name: str = "subtitle_translation", log_to_file: bool = True):
-    """初始化日志记录器
-
-    Args:
-        name: 日志记录器名称
-        log_to_file: 是否同时写入文件
-    """
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-
-    if logger.hasHandlers():
-        logger.handlers.clear()
-
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    if log_to_file:
-        log_filename = datetime.now().strftime('%Y-%m-%d_%H-%M-%S') + '.log'
-        log_filepath = LOG_DIR / log_filename
-
-        file_handler = RotatingFileHandler(
-            log_filepath,
-            maxBytes=10 * 1024 * 1024,
-            backupCount=5,
-            encoding='utf-8'
-        )
-        file_handler.setLevel(logging.INFO)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-
-    return logger
-
-
-def get_logger(name: str = "subtitle_translation"):
-    """获取日志记录器实例（已初始化的）"""
-    logger = logging.getLogger(name)
-    if not logger.hasHandlers():
-        init_logger(name)
-    return logger
-
-
-def log_with_timestamp(logger, message: str, level: str = "info"):
-    """带时间戳的日志记录
-
-    Args:
-        logger: 日志记录器实例
-        message: 日志消息
-        level: 日志级别 (debug/info/warning/error)
-    """
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    formatted_message = f"[{timestamp}] {message}"
-
-    if level == "debug":
-        logger.debug(formatted_message)
-    elif level == "info":
-        logger.info(formatted_message)
-    elif level == "warning":
-        logger.warning(formatted_message)
-    elif level == "error":
-        logger.error(formatted_message)
-    else:
-        logger.info(formatted_message)
-
-
-def timestamp_print(message):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {message}")
-
-
-def log_message(message, level="INFO"):
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    prefix = f"[{level.upper()}]"
-    log_line = f"[{timestamp}] {prefix} {message}"
-    try:
-        print(log_line)
-    except UnicodeEncodeError:
-        log_line = log_line.replace('✓', '[OK]').replace('✗', '[ERROR]')
-        print(log_line)
-
-
-def cleanup_duplicate_files(directory):
-    if not os.path.exists(directory):
-        return
-    file_groups = {}
-    for file in os.listdir(directory):
-        match = re.match(r'^(.*)\.(\d+)\.(.*)$', file)
-        if match:
-            base_name = match.group(1)
-            ext = match.group(3)
-            original_file = f"{base_name}.{ext}"
-            if original_file not in file_groups:
-                file_groups[original_file] = []
-            file_groups[original_file].append(file)
-    for original_file, duplicate_files in file_groups.items():
-        original_path = os.path.join(directory, original_file)
-        if os.path.exists(original_path):
-            for duplicate_file in duplicate_files:
-                duplicate_path = os.path.join(directory, duplicate_file)
-                try:
-                    os.remove(duplicate_path)
-                except Exception:
-                    pass
-
-
-def get_optimal_threads():
-    try:
-        import multiprocessing
-        cpu_count = multiprocessing.cpu_count()
-        optimal_threads = max(8, min(16, cpu_count * 2))
-        return optimal_threads
-    except Exception:
-        return 16

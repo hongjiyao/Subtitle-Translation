@@ -59,7 +59,6 @@ urllib3==2.6.3
 soundfile==0.13.1
 cffi==2.0.0
 pycparser==3.0
-silero-vad==6.2.1
 
 # 模型加速
 accelerate==1.13.0

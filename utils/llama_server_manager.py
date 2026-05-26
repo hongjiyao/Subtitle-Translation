@@ -16,7 +16,7 @@ from config import config, ServerParams, PROJECT_ROOT
 
 
 class LlamaServerManager:
-    def __init__(self, system_prompt=None, port=None, server_params: ServerParams = None):
+    def __init__(self, port=None, server_params: ServerParams = None):
         if server_params is None:
             server_params = ServerParams()
         self._server_params = server_params
@@ -24,7 +24,6 @@ class LlamaServerManager:
         self.port = port or server_params.port
         self.context_size = server_params.ctx_size
         self.threads = server_params.threads
-        self.system_prompt = system_prompt
 
         self.process: Optional[subprocess.Popen] = None
         self.pid = None
@@ -54,17 +53,18 @@ class LlamaServerManager:
                 return
 
         self.server_path = None
+        print(f"[llama-server] 未找到 llama-server 可执行文件")
 
     def _find_model_path(self):
         from config import MODEL_CACHE_DIR
-        quantization = config.get('translator_quantization', 'auto')
+        quantization = self._server_params.quantization
 
         # 打印 MODEL_CACHE_DIR 路径
         print(f"[llama-server] 模型缓存目录: {MODEL_CACHE_DIR}")
 
         model_dirs = [
-            os.path.join(MODEL_CACHE_DIR, "tencent--HY-MT1.5-7B-GGUF"),
-            os.path.join(MODEL_CACHE_DIR, "HY-MT1.5-7B-GGUF"),
+            os.path.join(MODEL_CACHE_DIR, "tencent--HY-MT1.5-1.8B-GGUF"),
+            os.path.join(MODEL_CACHE_DIR, "HY-MT1.5-1.8B-GGUF"),
         ]
 
         for model_dir in model_dirs:
@@ -125,6 +125,7 @@ class LlamaServerManager:
             response = requests.get(url, timeout=5)
             return response.status_code == 200
         except requests.exceptions.RequestException:
+            print(f"[llama-server] 健康检查失败: {self.host}:{self.port}")
             return False
 
     def start_server(self) -> bool:
@@ -143,6 +144,7 @@ class LlamaServerManager:
 
         ngl = self._server_params.ngl
         batch_size = self._server_params.batch_size
+        parallel_slots = self._server_params.parallel_slots
         cmd = [
             self.server_path,
             "-m", self.model_path,
@@ -152,32 +154,27 @@ class LlamaServerManager:
             "-b", str(batch_size),
             "-t", str(self.threads),
             "-ngl", str(ngl),
+            "-np", str(parallel_slots),
+            "--flash-attn", "auto",
             "--no-mmap",
         ]
         
-        # 添加系统提示词（如果提供）
-        if self.system_prompt:
-            # 使用环境变量设置系统提示词，避免命令行参数解析问题
-            os.environ['LLAMA_SYSTEM_PROMPT'] = self.system_prompt
-
         try:
             print(f"[llama-server] 启动命令: {' '.join(cmd)}")
+            log_dir = os.path.join(PROJECT_ROOT, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            log_path = os.path.join(log_dir, "llama_server.log")
+            log_file = open(log_path, "w", encoding="utf-8")
             self.process = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',
-                errors='ignore'
+                stdout=subprocess.DEVNULL,
+                stderr=log_file,
             )
             self.pid = self.process.pid
             time.sleep(0.5)
 
             if self.process.poll() is not None:
-                stdout, stderr = self.process.communicate()
                 print(f"[llama-server] 启动失败，退出码: {self.process.returncode}")
-                print(f"[llama-server] 标准输出: {stdout[:500]}")
-                print(f"[llama-server] 标准错误: {stderr[:500]}")
                 return False
 
             for _ in range(15):
@@ -200,20 +197,20 @@ class LlamaServerManager:
 
         try:
             if os.name == 'nt':
-                self.process.terminate()
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(self.process.pid)],
+                               capture_output=True, timeout=5)
             else:
                 self.process.send_signal(signal.SIGTERM)
-            
+
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                if os.name == 'nt':
-                    self.process.kill()
-                else:
+                print(f"[llama-server] 停止服务器超时，强制终止进程")
+                if os.name != 'nt':
                     self.process.send_signal(signal.SIGKILL)
-                self.process.wait()
-        except Exception:
-            pass
+                    self.process.wait()
+        except Exception as e:
+            print(f"[llama-server] 停止服务器异常: {e}")
 
         self.process = None
         self.pid = None
@@ -227,6 +224,7 @@ class LlamaServerManager:
         
         if not self.start_server():
             self.fail_count += 1
+            print(f"[llama-server] 服务器启动失败 (第{self.fail_count}次)")
             if self.fail_count >= self.max_failures:
                 print(f"[llama-server] 服务器连续启动失败 {self.fail_count} 次，尝试强制重启")
                 self.fail_count = 0
@@ -256,20 +254,21 @@ class LlamaServerManager:
         
         return success
 
-    def send_request(self, prompt: str, **kwargs) -> Optional[str]:
+    def send_chat_request(self, messages: list, **kwargs) -> Optional[str]:
         if not self.ensure_server_running():
             return None
 
-        url = f"http://{self.host}:{self.port}/completion"
+        url = f"http://{self.host}:{self.port}/v1/chat/completions"
 
         params = {
-            "prompt": prompt,
+            "messages": messages,
             "n_predict": kwargs.get("n_predict", 256),
             "temperature": kwargs.get("temperature", 0.0),
             "top_k": kwargs.get("top_k", 20),
             "top_p": kwargs.get("top_p", 0.6),
             "repeat_penalty": kwargs.get("repeat_penalty", 1.05),
             "stop": kwargs.get("stop", []),
+            "cache_prompt": True,
         }
 
         try:
@@ -278,13 +277,24 @@ class LlamaServerManager:
                 json=params,
                 timeout=kwargs.get("timeout", 120)
             )
-            
+
             if response.status_code == 200:
                 self.fail_count = 0
-                return response.json().get("content", "")
+                data = response.json()
+                choices = data.get("choices", [])
+                if choices:
+                    message = choices[0].get("message", {})
+                    return message.get("content", "")
+                print(f"[llama-server] Chat请求返回空choices")
+                return ""
             else:
                 self.fail_count += 1
-                print(f"[llama-server] 请求失败: HTTP {response.status_code}")
+                try:
+                    error_body = response.text[:500]
+                except Exception:
+                    print(f"[llama-server] 获取错误响应体失败")
+                    error_body = ""
+                print(f"[llama-server] Chat请求失败: HTTP {response.status_code}, 响应: {error_body}")
                 return None
 
         except requests.exceptions.Timeout:

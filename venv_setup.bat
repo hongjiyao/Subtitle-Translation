@@ -135,7 +135,7 @@ if not errorlevel 1 goto :torch_found
 :torch_not_found
 :: Download PyTorch to local directory
 echo Downloading PyTorch (CUDA 12.6) to %PACKAGES_DIR%...
-"%VENV_NAME%\Scripts\pip.exe" download torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 -i "https://download.pytorch.org/whl/cu126" -d "%PACKAGES_DIR%"
+"%VENV_NAME%\Scripts\pip.exe" download torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 -i "https://download.pytorch.org/whl/cu128" -d "%PACKAGES_DIR%"
 if errorlevel 1 (
     echo [WARN] PyTorch download may have failed, continuing...
 ) else (
