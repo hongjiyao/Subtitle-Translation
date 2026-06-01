@@ -6,6 +6,7 @@
 
 import os
 import sys
+import time
 import requests
 import zipfile
 import shutil
@@ -31,6 +32,7 @@ def log_message(message):
 
 def download_file(url, save_path, max_retries=3):
     """下载文件并显示进度，支持断点续传和重试"""
+    retry_delays = [30, 60, 120]
     for retry in range(max_retries):
         try:
             # 检查文件是否已存在且有部分内容
@@ -81,8 +83,7 @@ def download_file(url, save_path, max_retries=3):
                     os.remove(save_path)
                 if retry < max_retries - 1:
                     log_message("正在重试...")
-                    import time
-                    time.sleep(120)  # 等待120秒后重试
+                    time.sleep(retry_delays[min(retry, len(retry_delays) - 1)])
                 else:
                     log_message("达到最大重试次数")
                 return False
@@ -90,8 +91,7 @@ def download_file(url, save_path, max_retries=3):
             log_message(f"网络请求失败 (尝试 {retry+1}/{max_retries}): {str(e)}")
             if retry < max_retries - 1:
                 log_message("正在重试...")
-                import time
-                time.sleep(120)  # 等待120秒后重试
+                time.sleep(retry_delays[min(retry, len(retry_delays) - 1)])
             else:
                 log_message("达到最大重试次数")
                 return False
@@ -99,8 +99,7 @@ def download_file(url, save_path, max_retries=3):
             log_message(f"下载失败 (尝试 {retry+1}/{max_retries}): {str(e)}")
             if retry < max_retries - 1:
                 log_message("正在重试...")
-                import time
-                time.sleep(120)  # 等待120秒后重试
+                time.sleep(retry_delays[min(retry, len(retry_delays) - 1)])
             else:
                 log_message("达到最大重试次数")
                 return False
@@ -216,7 +215,7 @@ def main():
         response = requests.get("https://github.com", timeout=10)
         if response.status_code != 200:
             log_message("警告: 无法访问GitHub")
-    except:
+    except Exception:
         log_message("警告: 网络连接失败")
     
     # 下载llama.cpp

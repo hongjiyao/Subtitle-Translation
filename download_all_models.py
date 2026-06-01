@@ -9,8 +9,10 @@ import os
 import sys
 import subprocess
 import json
+import hashlib
 import requests
 import time
+import logging
 from tqdm import tqdm
 
 # 强制使用 UTF-8 编码
@@ -51,45 +53,79 @@ if not ARIA2C_PATH:
 
 # 定义需要下载的模型
 MODELS = [
-    # 原始Whisper模型
-    {"id": "openai/whisper-large-v3-turbo", "dir": "openai--whisper-large-v3-turbo", "priority": "high", "type": "whisper", "download": True},
-    # HY-MT1.5-1.8B-GGUF翻译模型
-    {"id": "tencent/HY-MT1.5-1.8B-GGUF", "dir": "tencent--HY-MT1.5-1.8B-GGUF", "priority": "high", "type": "gguf", "download": True},
-    # Wav2Vec2 对齐模型 - 多语言支持
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-english", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-english", "priority": "medium", "type": "wav2vec2", "download": False},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn", "priority": "medium", "type": "wav2vec2", "download": False},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-japanese", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-japanese", "priority": "medium", "type": "wav2vec2", "download": False},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-french", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-french", "priority": "low", "type": "wav2vec2", "download": False},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-german", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-german", "priority": "low", "type": "wav2vec2", "download": False},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-spanish", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-spanish", "priority": "low", "type": "wav2vec2", "download": False},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-russian", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-russian", "priority": "low", "type": "wav2vec2", "download": False},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-arabic", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-arabic", "priority": "low", "type": "wav2vec2", "download": False},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-portuguese", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-portuguese", "priority": "low", "type": "wav2vec2", "download": False},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-italian", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-italian", "priority": "low", "type": "wav2vec2", "download": False},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-dutch", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-dutch", "priority": "low", "type": "wav2vec2", "download": False},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-polish", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-polish", "priority": "low", "type": "wav2vec2", "download": False},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-finnish", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-finnish", "priority": "low", "type": "wav2vec2", "download": False},
-    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-persian", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-persian", "priority": "low", "type": "wav2vec2", "download": False}
+    {"id": "openai/whisper-large-v3-turbo", "dir": "openai--whisper-large-v3-turbo", "priority": "high", "type": "whisper", "download": True, "sha256": ""},
+    {"id": "tencent/HY-MT1.5-1.8B-GGUF", "dir": "tencent--HY-MT1.5-1.8B-GGUF", "priority": "high", "type": "gguf", "download": True, "sha256": ""},
+    {"id": "SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF", "dir": "SakuraLLM--Sakura-7B-Qwen2.5-v1.0-GGUF", "priority": "high", "type": "gguf", "download": True, "sha256": ""},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-english", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-english", "priority": "medium", "type": "wav2vec2", "download": False, "sha256": ""},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-chinese-zh-cn", "priority": "medium", "type": "wav2vec2", "download": False, "sha256": ""},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-japanese", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-japanese", "priority": "medium", "type": "wav2vec2", "download": False, "sha256": ""},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-french", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-french", "priority": "low", "type": "wav2vec2", "download": False, "sha256": ""},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-german", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-german", "priority": "low", "type": "wav2vec2", "download": False, "sha256": ""},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-spanish", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-spanish", "priority": "low", "type": "wav2vec2", "download": False, "sha256": ""},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-russian", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-russian", "priority": "low", "type": "wav2vec2", "download": False, "sha256": ""},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-arabic", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-arabic", "priority": "low", "type": "wav2vec2", "download": False, "sha256": ""},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-portuguese", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-portuguese", "priority": "low", "type": "wav2vec2", "download": False, "sha256": ""},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-italian", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-italian", "priority": "low", "type": "wav2vec2", "download": False, "sha256": ""},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-dutch", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-dutch", "priority": "low", "type": "wav2vec2", "download": False, "sha256": ""},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-polish", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-polish", "priority": "low", "type": "wav2vec2", "download": False, "sha256": ""},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-finnish", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-finnish", "priority": "low", "type": "wav2vec2", "download": False, "sha256": ""},
+    {"id": "jonatasgrosman/wav2vec2-large-xlsr-53-persian", "dir": "jonatasgrosman--wav2vec2-large-xlsr-53-persian", "priority": "low", "type": "wav2vec2", "download": False, "sha256": ""}
 ]
 
 # 简化日志输出
+_logger = logging.getLogger("download_models")
+_logger.setLevel(logging.DEBUG)
+_file_handler = logging.FileHandler("download_log.txt", encoding="utf-8")
+_file_handler.setLevel(logging.DEBUG)
+_file_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+_logger.addHandler(_file_handler)
+
+_LEVEL_MAP = {
+    "INFO": logging.INFO,
+    "ERROR": logging.ERROR,
+    "WARNING": logging.WARNING,
+    "SUCCESS": logging.INFO,
+}
+
+def verify_sha256(file_path, expected_hash):
+    if not expected_hash:
+        return True
+    sha256 = hashlib.sha256()
+    with open(file_path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            sha256.update(chunk)
+    actual_hash = sha256.hexdigest()
+    if actual_hash != expected_hash.lower():
+        log_message(f"[校验失败] {file_path}", "ERROR")
+        log_message(f"  期望: {expected_hash.lower()}", "ERROR")
+        log_message(f"  实际: {actual_hash}", "ERROR")
+        return False
+    log_message(f"[OK] SHA256 校验通过: {os.path.basename(file_path)}", "SUCCESS")
+    return True
+
 def log_message(message, level="INFO"):
-    """记录日志信息"""
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     prefix = f"[{level.upper()}]"
     log_line = f"[{timestamp}] {prefix} {message}"
-    # 确保输出使用正确的编码
     try:
         print(log_line)
     except UnicodeEncodeError:
-        # 替换Unicode字符为ASCII
         log_line = log_line.replace('✓', '[OK]').replace('✗', '[ERROR]')
         print(log_line)
-    # 同时将日志写入文件
-    with open("download_log.txt", "a", encoding="utf-8") as f:
-        f.write(log_line + "\n")
+    _logger.log(_LEVEL_MAP.get(level.upper(), logging.INFO), message)
 
 # 检查本地 aria2 是否存在
+import re
+
+_SHELL_META_RE = re.compile(r'[|;&$`\\]')
+
+def validate_url(url):
+    if _SHELL_META_RE.search(url):
+        raise ValueError(f"URL contains shell metacharacters: {url}")
+    if not url.startswith(('http://', 'https://')):
+        raise ValueError(f"URL must start with http:// or https://: {url}")
+    return url
+
 def check_aria2():
     """检查本地 aria2 是否存在"""
     global ARIA2C_PATH
@@ -131,7 +167,7 @@ def check_internet_connection():
     try:
         response = requests.get("https://hf-mirror.com", timeout=10)
         return True
-    except:
+    except Exception:
         return False
 
 # 清理目录中的重复文件（带有数字后缀的文件）
@@ -354,15 +390,16 @@ def download_file(url, file_path, use_aria2=False):
             log_message("尝试使用curl作为备用方案")
     
     # 使用curl下载（作为备用方案）
+    validate_url(url)
+
     log_message("使用curl命令下载，显示详细进度条")
-    command = f'curl -L -o "{file_path}" "{url}" --progress-bar'
-    
+    cmd = ["curl", "-L", "-o", file_path, url, "--progress-bar"]
+
     result = subprocess.run(
-        command,
-        shell=True,
-        capture_output=False,  # 不捕获输出，让进度条实时显示
+        cmd,
+        capture_output=False,
         text=True,
-        timeout=3600  # 1小时超时
+        timeout=3600
     )
     
     if result.returncode == 0:
@@ -410,13 +447,13 @@ def download_model(model_info):
         # 只下载必要文件
         required_files = []
         if model_type == "gguf":
-            # GGUF模型只下载.gguf文件，优先选择q8版本
             q8_files = [file for file in files if file.endswith(".gguf") and "q8" in file.lower()]
+            q6_files = [file for file in files if file.endswith(".gguf") and "q6" in file.lower()]
             if q8_files:
-                # 只下载q8版本
                 required_files = q8_files
+            elif q6_files:
+                required_files = q6_files
             else:
-                # 如果没有q8版本，下载所有gguf文件
                 for file in files:
                     if file.endswith(".gguf"):
                         required_files.append(file)
@@ -454,6 +491,11 @@ def download_model(model_info):
             
             if not download_file(url, file_path, use_aria2):
                 return False
+
+            expected_hash = model_info.get("sha256", "")
+            if expected_hash and os.path.exists(file_path):
+                if not verify_sha256(file_path, expected_hash):
+                    log_message(f"[WARNING] SHA256 校验失败，文件可能不完整: {file}", "WARNING")
         
         # 下载完成后，清理整个模型目录中的重复文件
         log_message("清理模型目录中的重复文件...")
@@ -485,8 +527,8 @@ def test_model_usability(model_info):
     log_message(f"\n=== 测试模型可用性: {model_id} ===", "INFO")
     
     # 特殊处理: 跳过 tencent/HY-MT1.5-1.8B-GGUF 模型的测试
-    if model_id == "tencent/HY-MT1.5-1.8B-GGUF":
-        log_message("[INFO] 跳过 tencent/HY-MT1.5-1.8B-GGUF 模型的测试")
+    if model_id in ("tencent/HY-MT1.5-1.8B-GGUF", "SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF"):
+        log_message(f"[INFO] 跳过 {model_id} 模型的测试")
         return True
     
     # 首先检查模型完整性

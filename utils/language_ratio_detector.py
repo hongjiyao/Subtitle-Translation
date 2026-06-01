@@ -24,6 +24,21 @@ LANGUAGE_RANGES = {
 }
 
 
+LATIN_LANGS = {'en', 'fr', 'de', 'es', 'pt', 'it', 'nl', 'pl', 'sv', 'no', 'da', 'fi', 'cs', 'sk', 'hu', 'ro', 'bg', 'hr', 'sl', 'lt', 'lv', 'et', 'tr', 'id', 'ms', 'vi', 'tl'}
+CYRILLIC_LANGS = {'ru', 'uk', 'be', 'bg', 'sr', 'mk'}
+ARABIC_LANGS = {'ar', 'fa', 'ur', 'ps'}
+DEVANAGARI_LANGS = {'hi', 'bn', 'ne', 'mr'}
+THAI_LANGS = {'th', 'lo'}
+
+LANG_NAMES = {
+    'zh': '中文', 'ja': '日文', 'ko': '韩文', 'en': '英文',
+    'fr': '法文', 'de': '德文', 'es': '西班牙文', 'pt': '葡萄牙文',
+    'it': '意大利文', 'nl': '荷兰文', 'pl': '波兰文', 'ru': '俄文',
+    'ar': '阿拉伯文', 'hi': '印地文', 'th': '泰文', 'fa': '波斯文',
+    'fi': '芬兰文',
+}
+
+
 def is_other_chinese_char(char: str) -> bool:
     """检测字符是否为中文标点符号
 
@@ -205,12 +220,48 @@ def calculate_language_ratio(text: str, language: str = 'chinese') -> float:
     return target_count / total if total > 0 else 0.0
 
 
+def _calculate_target_language_ratio(text, target_lang, original_text='', source_lang='', trans_params=None):
+    if not text:
+        return 0.0
+    lang_counts = detect_language_chars(text)
+    total = len(text)
+    if total == 0:
+        return 0.0
+    if target_lang == 'zh':
+        if source_lang == 'ja':
+            non_cjk = total - lang_counts['chinese'] - lang_counts['japanese'] - lang_counts['korean']
+            cjk_chars = lang_counts['chinese'] + lang_counts['japanese']
+            kana_chars = lang_counts['japanese']
+            kana_threshold = trans_params.kana_ratio_threshold if trans_params else 0.3
+            if cjk_chars > 0 and kana_chars / cjk_chars > kana_threshold:
+                return 0.0
+            return (lang_counts['chinese'] + lang_counts['japanese']) / total
+        return lang_counts['chinese'] / total
+    elif target_lang == 'ja':
+        return (lang_counts['japanese'] + lang_counts['chinese']) / total
+    elif target_lang == 'ko':
+        return lang_counts['korean'] / total
+    elif target_lang in LATIN_LANGS:
+        return lang_counts['latin'] / total
+    elif target_lang in CYRILLIC_LANGS:
+        return lang_counts['cyrillic'] / total
+    elif target_lang in ARABIC_LANGS:
+        return lang_counts['arabic'] / total
+    elif target_lang in DEVANAGARI_LANGS:
+        return lang_counts['devanagari'] / total
+    elif target_lang in THAI_LANGS:
+        return lang_counts['thai'] / total
+    else:
+        return 1.0 if (text.strip() and text.strip() != original_text.strip()) else 0.0
+
+
 def check_translation_success(
     original_text: str,
     translated_text: str,
     source_lang: str = 'ja',
     target_lang: str = 'zh',
-    threshold: float = 0.5
+    threshold: float = 0.5,
+    trans_params=None
 ) -> Tuple[bool, float, Dict[str, int]]:
     """检查翻译是否成功
 
@@ -238,48 +289,22 @@ def check_translation_success(
         return False, 0.0, {}
 
     lang_counts = detect_language_chars(translated_text)
+    target_ratio = _calculate_target_language_ratio(translated_text, target_lang, original_text, source_lang, trans_params=trans_params)
 
-    # Language family mapping
-    LATIN_LANGS = {'en', 'fr', 'de', 'es', 'pt', 'it', 'nl', 'pl', 'sv', 'no', 'da', 'fi', 'cs', 'sk', 'hu', 'ro', 'bg', 'hr', 'sl', 'lt', 'lv', 'et', 'tr', 'id', 'ms', 'vi', 'tl'}
-    CYRILLIC_LANGS = {'ru', 'uk', 'be', 'bg', 'sr', 'mk'}
-    ARABIC_LANGS = {'ar', 'fa', 'ur', 'ps'}
-    DEVANAGARI_LANGS = {'hi', 'bn', 'ne', 'mr'}
-    THAI_LANGS = {'th', 'lo'}
-
-    if target_lang == 'zh':
-        target_ratio = lang_counts['chinese'] / total
-    elif target_lang == 'ja':
-        target_ratio = (lang_counts['japanese'] + lang_counts['chinese']) / total
-    elif target_lang == 'ko':
-        target_ratio = lang_counts['korean'] / total
-    elif target_lang in LATIN_LANGS:
-        target_ratio = lang_counts['latin'] / total
-    elif target_lang in CYRILLIC_LANGS:
-        target_ratio = lang_counts['cyrillic'] / total
-    elif target_lang in ARABIC_LANGS:
-        target_ratio = lang_counts['arabic'] / total
-    elif target_lang in DEVANAGARI_LANGS:
-        target_ratio = lang_counts['devanagari'] / total
-    elif target_lang in THAI_LANGS:
-        target_ratio = lang_counts['thai'] / total
-    else:
-        # Fallback: check that translation differs from source and is non-empty
-        target_ratio = 1.0 if (translated_text.strip() and translated_text.strip() != original_text.strip()) else 0.0
-
-    # 判断翻译是否成功
     success = target_ratio >= threshold
 
     return success, target_ratio, lang_counts
 
 
-def is_translation_valid(original_text, translated_text, source_lang='ja', target_lang='zh', threshold=0.5):
+def is_translation_valid(original_text, translated_text, source_lang='ja', target_lang='zh', threshold=0.5, trans_params=None):
     if not translated_text:
         return False, 0.0, {}
     
     if original_text == translated_text and source_lang != target_lang:
         return False, 0.0, {}
     
-    if len(translated_text) <= 5:
+    short_text_threshold = trans_params.short_text_threshold if trans_params else 5
+    if len(translated_text) <= short_text_threshold:
         if original_text.strip() == translated_text.strip():
             return False, 0.0, {}
         lang_counts = detect_language_chars(translated_text)
@@ -290,7 +315,7 @@ def is_translation_valid(original_text, translated_text, source_lang='ja', targe
             return True, target_ratio, lang_counts
     
     success, target_ratio, lang_counts = check_translation_success(
-        original_text, translated_text, source_lang, target_lang, threshold=threshold
+        original_text, translated_text, source_lang, target_lang, threshold=threshold, trans_params=trans_params
     )
     
     return success, target_ratio, lang_counts
@@ -300,7 +325,8 @@ def get_translation_quality_info(
     original_text: str,
     translated_text: str,
     source_lang: str = 'ja',
-    target_lang: str = 'zh'
+    target_lang: str = 'zh',
+    trans_params=None
 ) -> Dict[str, Any]:
     """获取翻译质量详细信息
 
@@ -325,39 +351,7 @@ def get_translation_quality_info(
     lang_counts = detect_language_chars(translated_text)
     total_chars = len(translated_text)
 
-    # 使用与 check_translation_success 一致的语言族映射
-    LATIN_LANGS = {'en', 'fr', 'de', 'es', 'pt', 'it', 'nl', 'pl', 'sv', 'no', 'da', 'fi', 'cs', 'sk', 'hu', 'ro', 'bg', 'hr', 'sl', 'lt', 'lv', 'et', 'tr', 'id', 'ms', 'vi', 'tl'}
-    CYRILLIC_LANGS = {'ru', 'uk', 'be', 'bg', 'sr', 'mk'}
-    ARABIC_LANGS = {'ar', 'fa', 'ur', 'ps'}
-    DEVANAGARI_LANGS = {'hi', 'bn', 'ne', 'mr'}
-    THAI_LANGS = {'th', 'lo'}
-
-    LANG_NAMES = {
-        'zh': '中文', 'ja': '日文', 'ko': '韩文', 'en': '英文',
-        'fr': '法文', 'de': '德文', 'es': '西班牙文', 'pt': '葡萄牙文',
-        'it': '意大利文', 'nl': '荷兰文', 'pl': '波兰文', 'ru': '俄文',
-        'ar': '阿拉伯文', 'hi': '印地文', 'th': '泰文', 'fa': '波斯文',
-        'fi': '芬兰文',
-    }
-
-    if target_lang == 'zh':
-        target_ratio = lang_counts['chinese'] / total_chars if total_chars > 0 else 0.0
-    elif target_lang == 'ja':
-        target_ratio = (lang_counts['japanese'] + lang_counts['chinese']) / total_chars if total_chars > 0 else 0.0
-    elif target_lang == 'ko':
-        target_ratio = lang_counts['korean'] / total_chars if total_chars > 0 else 0.0
-    elif target_lang in LATIN_LANGS:
-        target_ratio = lang_counts['latin'] / total_chars if total_chars > 0 else 0.0
-    elif target_lang in CYRILLIC_LANGS:
-        target_ratio = lang_counts['cyrillic'] / total_chars if total_chars > 0 else 0.0
-    elif target_lang in ARABIC_LANGS:
-        target_ratio = lang_counts['arabic'] / total_chars if total_chars > 0 else 0.0
-    elif target_lang in DEVANAGARI_LANGS:
-        target_ratio = lang_counts['devanagari'] / total_chars if total_chars > 0 else 0.0
-    elif target_lang in THAI_LANGS:
-        target_ratio = lang_counts['thai'] / total_chars if total_chars > 0 else 0.0
-    else:
-        target_ratio = 1.0 if (translated_text.strip() and translated_text.strip() != original_text.strip()) else 0.0
+    target_ratio = _calculate_target_language_ratio(translated_text, target_lang, original_text, trans_params=trans_params)
 
     target_lang_name = LANG_NAMES.get(target_lang, '目标语言')
 

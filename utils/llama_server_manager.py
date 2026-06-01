@@ -31,6 +31,7 @@ class LlamaServerManager:
         self.model_path: Optional[str] = None
         self.fail_count = 0
         self.max_failures = 3
+        self._log_file = None
 
         self._find_server_path()
         self._find_model_path()
@@ -55,17 +56,33 @@ class LlamaServerManager:
         self.server_path = None
         print(f"[llama-server] 未找到 llama-server 可执行文件")
 
-    def _find_model_path(self):
+    @classmethod
+    def find_model_path(cls, model_name):
         from config import MODEL_CACHE_DIR
-        quantization = self._server_params.quantization
+        translator = config.get('translator', 'tencent/HY-MT1.5-1.8B-GGUF-Q8_0')
 
-        # 打印 MODEL_CACHE_DIR 路径
+        quantization = None
+        for q in ["Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q5_0", "Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q3_K_S", "Q2_K"]:
+            if translator.endswith("-" + q):
+                quantization = q
+                translator_repo = translator[:-(len(q) + 1)]
+                break
+        if quantization is None:
+            translator_repo = translator
+
         print(f"[llama-server] 模型缓存目录: {MODEL_CACHE_DIR}")
+        print(f"[llama-server] 当前翻译模型: {translator}")
+        print(f"[llama-server] 仓库ID: {translator_repo}, 量化版本: {quantization}")
 
+        translator_dir_name = translator_repo.replace("/", "--")
         model_dirs = [
-            os.path.join(MODEL_CACHE_DIR, "tencent--HY-MT1.5-1.8B-GGUF"),
-            os.path.join(MODEL_CACHE_DIR, "HY-MT1.5-1.8B-GGUF"),
+            os.path.join(MODEL_CACHE_DIR, translator_dir_name),
         ]
+
+        if translator_repo == "tencent/HY-MT1.5-1.8B-GGUF":
+            model_dirs.append(os.path.join(MODEL_CACHE_DIR, "HY-MT1.5-1.8B-GGUF"))
+        elif translator_repo == "SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF":
+            model_dirs.append(os.path.join(MODEL_CACHE_DIR, "Sakura-7B-Qwen2.5-v1.0-GGUF"))
 
         for model_dir in model_dirs:
             print(f"[llama-server] 检查模型目录: {model_dir}")
@@ -74,43 +91,41 @@ class LlamaServerManager:
                 gguf_files = glob.glob(os.path.join(model_dir, "*.gguf"))
                 print(f"[llama-server] 找到 GGUF 文件: {gguf_files}")
                 if gguf_files:
-                    if quantization != "auto":
+                    if quantization:
                         print(f"[llama-server] 按量化版本查找: {quantization}")
                         for f in gguf_files:
                             if quantization in f:
-                                self.model_path = f
                                 print(f"[llama-server] 找到匹配的模型: {f}")
-                                return
+                                return f
                     print("[llama-server] 按优先顺序查找模型")
                     for preferred in ["Q2_K", "Q3_K_S", "Q3_K_M", "Q4_0", "Q4_K_S", "Q4_K_M", "Q5_0", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0"]:
                         for f in gguf_files:
                             if preferred in f:
-                                self.model_path = f
                                 print(f"[llama-server] 找到优先模型: {f}")
-                                return
-                    self.model_path = gguf_files[0]
+                                return f
                     print(f"[llama-server] 使用第一个模型: {gguf_files[0]}")
-                    return
+                    return gguf_files[0]
 
         search_pattern = os.path.join(MODEL_CACHE_DIR, "**", "*.gguf")
         print(f"[llama-server] 递归搜索模型: {search_pattern}")
         found = glob.glob(search_pattern, recursive=True)
         print(f"[llama-server] 递归搜索结果: {found}")
         if found:
-            if quantization != "auto":
+            if quantization:
                 print(f"[llama-server] 按量化版本查找: {quantization}")
                 for f in found:
                     if quantization in f:
-                        self.model_path = f
                         print(f"[llama-server] 找到匹配的模型: {f}")
-                        return
+                        return f
             smallest_file = min(found, key=os.path.getsize)
-            self.model_path = smallest_file
             print(f"[llama-server] 使用最小模型: {smallest_file}")
-            return
+            return smallest_file
 
-        self.model_path = None
         print("[llama-server] 未找到模型文件")
+        return None
+
+    def _find_model_path(self):
+        self.model_path = self.find_model_path(None)
 
     def is_server_running(self) -> bool:
         if self.process is None:
@@ -164,12 +179,21 @@ class LlamaServerManager:
             log_dir = os.path.join(PROJECT_ROOT, "logs")
             os.makedirs(log_dir, exist_ok=True)
             log_path = os.path.join(log_dir, "llama_server.log")
-            log_file = open(log_path, "w", encoding="utf-8")
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=log_file,
-            )
+            try:
+                self._log_file = open(log_path, "w", encoding="utf-8")
+            except Exception:
+                self._log_file = None
+            try:
+                self.process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=self._log_file if self._log_file else subprocess.DEVNULL,
+                )
+            except Exception:
+                if self._log_file is not None:
+                    self._log_file.close()
+                    self._log_file = None
+                raise
             self.pid = self.process.pid
             time.sleep(0.5)
 
@@ -214,6 +238,32 @@ class LlamaServerManager:
 
         self.process = None
         self.pid = None
+
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+            self._log_file = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop_server()
+        return False
+
+    def __del__(self):
+        try:
+            self.stop_server()
+        except Exception:
+            pass
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+            self._log_file = None
 
     def ensure_server_running(self) -> bool:
         if self.is_server_running():

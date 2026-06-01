@@ -1,8 +1,37 @@
 # -*- coding: utf-8 -*-
 import os
-
+import re
 import subprocess
 from config import TEMP_DIR
+
+_INVALID_PATH_CHARS_PATTERN = re.compile(r'[\x00-\x1f]')
+
+def _get_allowed_dirs():
+    dirs = []
+    try:
+        from config import PROJECT_ROOT, OUTPUT_DIR
+        dirs.append(os.path.realpath(PROJECT_ROOT))
+        dirs.append(os.path.realpath(OUTPUT_DIR))
+    except ImportError:
+        dirs.append(os.path.realpath(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    dirs.append(os.path.realpath(TEMP_DIR))
+    dirs.append(os.path.realpath(os.path.expanduser("~")))
+    return dirs
+
+_ALLOWED_DIRS = _get_allowed_dirs()
+
+def validate_path(file_path):
+    if not file_path or not isinstance(file_path, str):
+        raise ValueError("路径不能为空且必须为字符串")
+    if _INVALID_PATH_CHARS_PATTERN.search(file_path):
+        raise ValueError(f"路径包含非法控制字符: {file_path}")
+    resolved = os.path.realpath(file_path)
+    if resolved != os.path.normpath(os.path.abspath(file_path)):
+        raise ValueError(f"路径解析异常，可能包含路径遍历: {file_path}")
+    allowed = any(resolved.startswith(d + os.sep) or resolved == d for d in _ALLOWED_DIRS)
+    if not allowed:
+        raise ValueError(f"路径不在允许的目录范围内: {file_path}")
+    return resolved
 
 def find_ffmpeg():
     try:
@@ -34,6 +63,7 @@ def find_ffmpeg():
 
 def extract_audio(video_path):
     """从视频中提取音频"""
+    video_path = validate_path(video_path)
     import uuid
     # 使用唯一标识符生成临时音频文件名，避免文件冲突
     unique_id = str(uuid.uuid4())[:8]

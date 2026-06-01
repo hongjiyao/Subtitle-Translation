@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+from utils.video_processor import validate_path
 
 
 def _write_srt(segments, output_path, text_extractor, label):
@@ -9,12 +10,13 @@ def _write_srt(segments, output_path, text_extractor, label):
         os.makedirs(output_dir, exist_ok=True)
         base_name = os.path.splitext(os.path.basename(output_path))[0]
         final_path = os.path.join(output_dir, f"{base_name}.srt")
+        final_path = validate_path(final_path)
 
         with open(final_path, 'w', encoding='utf-8') as f:
             for i, seg in enumerate(segments, 1):
                 words = seg.get('words', [])
-                start_time = words[0]['start'] if words else seg.get('start', 0)
-                end_time = words[-1]['end'] if words else seg.get('end', 0)
+                start_time = words[0].get('start', seg.get('start', 0)) if words else seg.get('start', 0)
+                end_time = words[-1].get('end', seg.get('end', 0)) if words else seg.get('end', 0)
                 f.write(f"{i}\n")
                 f.write(f"{format_time(start_time)} --> {format_time(end_time)}\n")
                 f.write(f"{text_extractor(seg)}\n\n")
